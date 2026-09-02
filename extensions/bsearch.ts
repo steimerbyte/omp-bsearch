@@ -14,13 +14,11 @@ import { homedir } from "node:os";
 import { readFile, writeFile } from "node:fs/promises";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { TextContent } from "@oh-my-pi/pi-ai";
-import { Text } from "@oh-my-pi/pi-tui";
+import { Text, Markdown } from "@oh-my-pi/pi-tui";
 import type { Component } from "@oh-my-pi/pi-tui";
 import type { ToolRenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** OMP v18 settings path — different from pi's ~/.pi/agent/settings.json */
@@ -213,15 +211,99 @@ function okResult(text: string, details: BsearchDetails): AgentToolResult<Bsearc
 function errResult(message: string, details: BsearchDetails): AgentToolResult<BsearchDetails> {
   return { content: [textContent(message)], details, isError: true };
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Output parser
+interface ParsedSource {
+  index: number;
+  title: string;
+  url: string;
+  age?: string;
+  snippets: string[];
+}
+interface ParsedOutput {
+  query?: string;
+  totalSources: number;
+  sources: ParsedSource[];
+  rawText: string;
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Renderers (TUI presentation)
-// ─────────────────────────────────────────────────────────────────────────────
+const SOURCE_HEADER_RE = /^(\d+)\.\s+(.+)$/;
+const URL_LINE_RE = /^(https?:\/\/\S+)\s*$/;
+const SOURCES_HEADER_RE = /^📄\s+Sources\s+\((\d+)\):?\s*$/i;
+
+function parseBsearchOutput(text: string): ParsedOutput {
+  const lines = text.split("\n");
+  const sources: ParsedSource[] = [];
+  let totalSources = 0;
+  let current: ParsedSource | null = null;
+  let snippetBuffer: string[] = [];
+
+  const flush = () => {
+    if (current) {
+      current.snippets = snippetBuffer.map((s) => s.trim()).filter(Boolean);
+      sources.push(current);
+    }
+    current = null;
+    snippetBuffer = [];
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const trimmed = line.trim();
+
+    const headerMatch = SOURCES_HEADER_RE.exec(trimmed);
+    if (headerMatch) {
+      flush();
+      totalSources = parseInt(headerMatch[1] ?? "0", 10);
+      continue;
+    }
+
+    const numMatch = SOURCE_HEADER_RE.exec(trimmed);
+    if (numMatch) {
+      flush();
+      current = {
+        index: parseInt(numMatch[1] ?? "0", 10),
+        title: (numMatch[2] ?? "").trim(),
+        url: "",
+        snippets: [],
+      };
+      continue;
+    }
+
+    if (current && URL_LINE_RE.test(trimmed)) {
+      current.url = trimmed;
+      continue;
+    }
+
+    if (current && /^\(.+\)$/.test(trimmed)) {
+      current.age = trimmed.slice(1, -1);
+      continue;
+    }
+
+    if (current && trimmed.length > 0) {
+      snippetBuffer.push(trimmed);
+    }
+  }
+  flush();
+
+  return { totalSources: totalSources || sources.length, sources, rawText: text };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
+const MAX_ANSWER_LINES_COLLAPSED = 12;
+const MAX_SNIPPETS_PER_SOURCE_COLLAPSED = 2;
+const SOURCE_TITLE_BUDGET_DEFAULT = 80;
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, Math.max(0, max - 1)) + "…";
+}
 
 function renderCall(
   args: BsearchParams,
   _options: ToolRenderResultOptions,
-  theme: { fg: (k: string, s: string) => string; bold: (s: string) => string },
+  theme: Theme,
 ): Component {
   const q = stripControls(args.query ?? "");
   let line = theme.fg("toolTitle", theme.bold("brave_search "));
@@ -231,6 +313,7 @@ function renderCall(
   if (args.count !== undefined) meta.push(`count=${args.count}`);
   if (args.freshness) meta.push(`fresh=${args.freshness}`);
   if (args.country) meta.push(`cc=${args.country.toUpperCase()}`);
+  if (args.city) meta.push(`city=${args.city}`);
   if (args.local) meta.push("local");
   if (meta.length > 0) line += " " + theme.fg("muted", meta.join(" "));
   return new Text(line, 0, 0);
@@ -239,35 +322,154 @@ function renderCall(
 function renderResult(
   result: AgentToolResult<BsearchDetails>,
   options: ToolRenderResultOptions,
-  theme: { fg: (k: string, s: string) => string; bold?: (s: string) => string },
-  _args?: BsearchParams,
+  theme: Theme,
+  args?: BsearchParams,
 ): Component {
-  const isPartial = options.isPartial === true;
-  if (isPartial) {
-    return new Text(theme.fg("warning", "Searching Brave..."), 0, 0);
-  }
+  const fg = (k: import("@oh-my-pi/pi-coding-agent/modes/theme/schema").ThemeColor, s: string) => theme.fg(k, s);
+  const bold = (s: string) => theme.bold(s);
+  const dot = theme.sep.dot;
+
   if (result.isError) {
-    const lines = result.content.map((c) => c.text ?? "").join("\n");
-    return new Text(theme.fg("error", lines), 0, 0);
+    const msg = result.content.map((c) => ("text" in c ? c.text : "") ?? "").join("\n");
+    return new Text(fg("error", `✗ ${msg}`), 0, 0);
   }
-  const details = result.details;
-  const firstLine = (result.content[0]?.text ?? "").split("\n")[0] ?? "";
-  let summary = theme.fg("success", "✓ brave_search");
-  if (details?.urls?.length) {
-    summary += " " + theme.fg("muted", `${details.urls.length} source${details.urls.length === 1 ? "" : "s"}`);
-  } else {
-    summary += " " + theme.fg("muted", "(no URLs)");
+
+  const textBlock = result.content.find((c) => c.type === "text");
+  const rawText = (textBlock && "text" in textBlock ? textBlock.text : "") ?? "";
+  const urls = result.details?.urls ?? [];
+  const parsed = parseBsearchOutput(rawText);
+
+  const header = [
+    fg("toolTitle", bold("Brave Search")),
+    fg("muted", "—"),
+    fg("accent", args?.query ? truncate(args.query, 80) : "web search"),
+  ].join(" ");
+
+  const meta: string[] = [];
+  meta.push(`${urls.length} URL${urls.length === 1 ? "" : "s"}`);
+  meta.push(`${parsed.totalSources} source${parsed.totalSources === 1 ? "" : "s"}`);
+  if (args?.mode) meta.push(`mode=${args.mode}`);
+  if (args?.freshness) meta.push(`fresh=${args.freshness}`);
+  if (args?.country) meta.push(`cc=${args.country.toUpperCase()}`);
+  const headerMeta = fg("muted", meta.join(dot));
+  const expanded = options.expanded;
+  const maxSnippet = expanded ? 99 : MAX_SNIPPETS_PER_SOURCE_COLLAPSED;
+
+  const sourceLines: string[] = [];
+  for (const src of parsed.sources) {
+    let domain = "";
+    if (src.url) { try { domain = new URL(src.url).hostname.replace(/^www\./, ""); } catch { domain = ""; } }
+    const metaParts: string[] = [];
+    if (domain) metaParts.push(fg("dim", `(${domain})`));
+    if (src.age) metaParts.push(fg("muted", src.age));
+    const metaSuffix = metaParts.length > 0 ? ` ${metaParts.join(fg("dim", dot))}` : "";
+
+    const titleBudget = Math.max(20, SOURCE_TITLE_BUDGET_DEFAULT - metaSuffix.length);
+    const titleText = truncate(src.title, titleBudget);
+    const title = fg("accent", titleText);
+    const firstLine = src.url
+      ? `${title}${metaSuffix}  ${fg("dim", truncate(src.url, 90))}`
+      : `${title}${metaSuffix}`;
+    sourceLines.push(firstLine);
+
+    const snippetsToShow = src.snippets.slice(0, maxSnippet);
+    for (const snippet of snippetsToShow) {
+      sourceLines.push(`   ${fg("dim", "│")} ${fg("toolOutput", truncate(snippet, 160))}`);
+    }
+    if (!expanded && src.snippets.length > maxSnippet) {
+      sourceLines.push(`   ${fg("dim", "│")} ${fg("muted", `+${src.snippets.length - maxSnippet} more snippet${src.snippets.length - maxSnippet === 1 ? "" : "s"}`)}`);
+    }
   }
-  if (firstLine) {
-    summary += " " + theme.fg("dim", firstLine.slice(0, 80) + (firstLine.length > 80 ? "…" : ""));
+
+  const answerLines = expanded
+    ? [fg("dim", truncate(rawText.replace(/\s+/g, " ").trim(), 1200))]
+    : sourceLines.slice(0, MAX_ANSWER_LINES_COLLAPSED);
+
+  const sections = [
+    {
+      label: fg("toolTitle", bold("Sources")),
+      lines: sourceLines.length > 0 ? sourceLines : [fg("muted", "No sources returned")],
+    },
+    {
+      label: fg("toolTitle", bold("Metadata")),
+      lines: [
+        `${fg("muted", "Provider:")} ${fg("text", "Brave Search API")}`,
+ `${fg("muted", "Mode:")} ${fg("text", args?.mode ?? "llm")}`,
+        `${fg("muted", "Total sources:")} ${fg("text", String(parsed.totalSources))}`,
+        `${fg("muted", "URLs extracted:")} ${fg("text", String(urls.length))}`,
+      ],
+    },
+  ];
+
+  return buildFramedBlock({ header, headerMeta, sections, expanded }, theme);
+}
+
+interface FramedBlockSpec {
+  header: string;
+  headerMeta?: string;
+  sections: Array<{ label: string; lines: string[] }>;
+  expanded: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Framed block renderer (TTY box with sections)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildFramedBlock(spec: FramedBlockSpec, theme: Theme): Component {
+  const fg = (k: import("@oh-my-pi/pi-coding-agent/modes/theme/schema").ThemeColor, s: string) => theme.fg(k, s);
+  const width = 100;
+  const innerWidth = width - 2;
+  const topL = "╭";
+  const topR = "╮";
+  const botL = "╰";
+  const botR = "╯";
+  const teeR = "├";
+  const teeL = "┤";
+  const vert = "│";
+  const sep = "─";
+  const cap = sep.repeat(3);
+
+  const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
+  const widthOf = (s: string): number => {
+    const stripped = s.replace(ANSI_RE, "");
+    return Array.from(stripped).length;
+  };
+
+  const fmtHeader = (header: string, meta: string): string => {
+    const top = `${topL}${cap} ${header}`;
+    const room = width - widthOf(top) - 1;
+    const m = room > 6 ? ` ${meta}` : "";
+    const padLen = Math.max(1, width - widthOf(top) - widthOf(m) - 1);
+    const pad = sep.repeat(padLen);
+    return fg("borderAccent", `${top}${pad}${m}${topR}`);
+  };
+
+  const fmtSectionBar = (label: string): string => {
+    const left = `${teeR}${cap} ${label}`;
+    const padLen = Math.max(1, width - widthOf(left) - widthOf(teeL));
+    return fg("borderAccent", `${left}${sep.repeat(padLen)}${teeL}`);
+  };
+
+  const fmtLine = (line: string): string => {
+    const padLen = Math.max(1, innerWidth - widthOf(line) - 1);
+    return `${fg("borderAccent", vert)} ${line}${" ".repeat(padLen)}${fg("borderAccent", vert)}`;
+  };
+
+  const fmtBottom = (): string =>
+    fg("borderAccent", `${botL}${sep.repeat(width - 2)}${botR}`);
+
+  const out: string[] = [];
+  out.push(fmtHeader(spec.header, spec.headerMeta ?? ""));
+  for (const sec of spec.sections) {
+    out.push(fmtSectionBar(sec.label));
+    for (const line of sec.lines) out.push(fmtLine(line));
   }
-  return new Text(summary, 0, 0);
+  out.push(fmtBottom());
+  return new Text(out.join("\n"), 0, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Extension entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
 export default function bsearchExtension(pi: ExtensionAPI): void {
   const { Type } = pi.typebox;
 
