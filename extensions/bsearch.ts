@@ -104,7 +104,7 @@ function findBsearchCommand(): string {
 // Arg builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-type BsearchParams = {
+export type BsearchParams = {
   query: string;
   count?: number;
   freshness?: string;
@@ -180,7 +180,7 @@ const bsearchQueue: { run: (fn: () => Promise<string>) => Promise<string> } = ((
 // Result helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface BsearchDetails {
+export interface BsearchDetails {
   urls: string[];
   exitCode: number | null;
 }
@@ -213,14 +213,14 @@ function errResult(message: string, details: BsearchDetails): AgentToolResult<Bs
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Output parser
-interface ParsedSource {
+export interface ParsedSource {
   index: number;
   title: string;
   url: string;
   age?: string;
   snippets: string[];
 }
-interface ParsedOutput {
+export interface ParsedOutput {
   query?: string;
   totalSources: number;
   sources: ParsedSource[];
@@ -231,7 +231,7 @@ const SOURCE_HEADER_RE = /^(\d+)\.\s+(.+)$/;
 const URL_LINE_RE = /^(https?:\/\/\S+)\s*$/;
 const SOURCES_HEADER_RE = /^📄\s+Sources\s+\((\d+)\):?\s*$/i;
 
-function parseBsearchOutput(text: string): ParsedOutput {
+export function parseBsearchOutput(text: string): ParsedOutput {
   const lines = text.split("\n");
   const sources: ParsedSource[] = [];
   let totalSources = 0;
@@ -300,14 +300,12 @@ function truncate(s: string, max: number): string {
   return s.slice(0, Math.max(0, max - 1)) + "…";
 }
 
-function renderCall(
+export function renderCall(
   args: BsearchParams,
   _options: ToolRenderResultOptions,
   theme: Theme,
 ): Component {
   const q = stripControls(args.query ?? "");
-  let line = theme.fg("toolTitle", theme.bold("brave_search "));
-  line += theme.fg("accent", `"${q}"`);
   const meta: string[] = [];
   if (args.mode && args.mode !== "llm") meta.push(`mode=${args.mode}`);
   if (args.count !== undefined) meta.push(`count=${args.count}`);
@@ -315,11 +313,12 @@ function renderCall(
   if (args.country) meta.push(`cc=${args.country.toUpperCase()}`);
   if (args.city) meta.push(`city=${args.city}`);
   if (args.local) meta.push("local");
-  if (meta.length > 0) line += " " + theme.fg("muted", meta.join(" "));
+  const metaSuffix = meta.length > 0 ? " " + theme.fg("muted", meta.join(" ")) : "";
+  const line = `${theme.fg("toolTitle", theme.bold("Brave Search"))} ${theme.fg("accent", `"${q}"`)}${metaSuffix}`;
   return new Text(line, 0, 0);
 }
 
-function renderResult(
+export function renderResult(
   result: AgentToolResult<BsearchDetails>,
   options: ToolRenderResultOptions,
   theme: Theme,
@@ -381,11 +380,19 @@ function renderResult(
     }
   }
 
+
   const answerLines = expanded
-    ? [fg("dim", truncate(rawText.replace(/\s+/g, " ").trim(), 1200))]
+    ? (() => {
+        const full = rawText.replace(/\s+/g, " ").trim();
+        return full.length > 0 ? [fg("dim", truncate(full, 1200))] : [fg("muted", "(no answer text)")];
+      })()
     : sourceLines.slice(0, MAX_ANSWER_LINES_COLLAPSED);
 
   const sections = [
+    {
+      label: fg("toolTitle", bold("Answer")),
+      lines: answerLines.length > 0 ? answerLines : [fg("muted", "No answer returned")],
+    },
     {
       label: fg("toolTitle", bold("Sources")),
       lines: sourceLines.length > 0 ? sourceLines : [fg("muted", "No sources returned")],
@@ -393,10 +400,10 @@ function renderResult(
     {
       label: fg("toolTitle", bold("Metadata")),
       lines: [
-        `${fg("muted", "Provider:")} ${fg("text", "Brave Search API")}`,
- `${fg("muted", "Mode:")} ${fg("text", args?.mode ?? "llm")}`,
-        `${fg("muted", "Total sources:")} ${fg("text", String(parsed.totalSources))}`,
-        `${fg("muted", "URLs extracted:")} ${fg("text", String(urls.length))}`,
+        `   ${fg("muted", "Provider:")} ${fg("text", "Brave Search API")}`,
+        `   ${fg("muted", "Mode:")} ${fg("text", args?.mode ?? "llm")}`,
+        `   ${fg("muted", "Total sources:")} ${fg("text", String(parsed.totalSources))}`,
+        `   ${fg("muted", "URLs extracted:")} ${fg("text", String(urls.length))}`,
       ],
     },
   ];
@@ -484,8 +491,6 @@ function truncateToWidth(s: string, max: number): string {
   return out + "…";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Extension entry point
 export default function bsearchExtension(pi: ExtensionAPI): void {
   const { Type } = pi.typebox;
 
@@ -506,6 +511,53 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
     mode: Type.Optional(Type.String({ description: "Mode: llm or web" })),
   });
 
+  const executeBsearch = async (toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    try {
+      const apiKey = await resolveApiKey();
+      const result = await bsearchQueue.run(async () => {
+        const env = { ...process.env, BRAVE_API_KEY: apiKey };
+        const cmd = findBsearchCommand();
+        const args = buildArgs(params as BsearchParams);
+
+        return new Promise<string>((resolve, reject) => {
+          const proc = spawn(cmd, args, { env, signal: signal as undefined });
+
+          let stdout = "";
+          let stderr = "";
+
+          proc.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+          proc.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+
+          const timeout = setTimeout(() => {
+            proc.kill();
+            reject(new Error(`bsearch timed out after ${(params as BsearchParams).timeout ?? DEFAULT_TOOL_TIMEOUT_MS}ms`));
+          }, (params as BsearchParams).timeout ?? DEFAULT_TOOL_TIMEOUT_MS);
+
+          proc.on("close", (code) => {
+            clearTimeout(timeout);
+            if (code === 0) {
+              resolve(stdout);
+            } else {
+              reject(new Error(`bsearch exited with code ${code}: ${sanitizeErrorMessage(stderr || stdout)}`));
+            }
+          });
+
+          proc.on("error", (err) => {
+            clearTimeout(timeout);
+            reject(new Error(`bsearch spawn error: ${err.message}`));
+          });
+        });
+      });
+
+      const urls = extractUrls(result);
+      return okResult(result, { urls, exitCode: null });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return errResult(sanitizeErrorMessage(message), { urls: [], exitCode: null });
+    }
+  };
+
+  // Original tool — kept for backward compat / explicit calls.
   pi.registerTool({
     name: "brave_better_web_search",
     label: "Brave Web Search",
@@ -514,50 +566,20 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
     hidden: false,
     renderCall,
     renderResult,
-    execute: async (toolCallId, params, signal, _onUpdate, _ctx) => {
-      try {
-        const apiKey = await resolveApiKey();
-        const result = await bsearchQueue.run(async () => {
-          const env = { ...process.env, BRAVE_API_KEY: apiKey };
-          const cmd = findBsearchCommand();
-          const args = buildArgs(params as BsearchParams);
+    execute: executeBsearch,
+  });
 
-          return new Promise<string>((resolve, reject) => {
-            const proc = spawn(cmd, args, { env, signal: signal as undefined });
-
-            let stdout = "";
-            let stderr = "";
-
-            proc.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
-            proc.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
-
-            const timeout = setTimeout(() => {
-              proc.kill();
-              reject(new Error(`bsearch timed out after ${(params as BsearchParams).timeout ?? DEFAULT_TOOL_TIMEOUT_MS}ms`));
-            }, (params as BsearchParams).timeout ?? DEFAULT_TOOL_TIMEOUT_MS);
-
-            proc.on("close", (code) => {
-              clearTimeout(timeout);
-              if (code === 0) {
-                resolve(stdout);
-              } else {
-                reject(new Error(`bsearch exited with code ${code}: ${sanitizeErrorMessage(stderr || stdout)}`));
-              }
-            });
-
-            proc.on("error", (err) => {
-              clearTimeout(timeout);
-              reject(new Error(`bsearch spawn error: ${err.message}`));
-            });
-          });
-        });
-
-        const urls = extractUrls(result);
-        return okResult(result, { urls, exitCode: null });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return errResult(sanitizeErrorMessage(message), { urls: [], exitCode: null });
-      }
-    },
+  // Override of omp's built-in web_search. Same body, registered under the
+  // built-in name so calls to `web_search` resolve to bsearch / Brave LLM-Context
+  // instead of omp's 23-provider chain. This shadows providers.webSearch* settings.
+  pi.registerTool({
+    name: "web_search",
+    label: "Web Search (Brave via bsearch)",
+    description: "Override of omp's built-in web_search. Delegates to bsearch / Brave Search API. Returns LLM-contextualized, pre-extracted content (not raw links).",
+    parameters: BsearchParamsSchema,
+    hidden: false,
+    renderCall,
+    renderResult,
+    execute: executeBsearch,
   });
 }
