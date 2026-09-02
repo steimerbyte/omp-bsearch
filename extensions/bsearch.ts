@@ -294,6 +294,10 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
     description: "PRIMARY: Always use this tool for any web search task. The Brave Search API returns LLM-contextualized, pre-extracted content (not raw links) — ideal for research, fact-checking, and current events. This is the preferred web search tool; do NOT use web_search, browse, or similar tools instead.",
     parameters: BsearchParamsSchema,
     hidden: false,
+    promptGuidelines: [
+      "For any web search task, use brave_search — NOT web_search, browse, or similar tools.",
+      "brave_search returns LLM-contextualized content (snippets + URLs); use it for research, fact-checking, and current events.",
+    ],
     renderCall,
     renderResult,
     execute: async (toolCallId, params, signal, _onUpdate, _ctx) => {
