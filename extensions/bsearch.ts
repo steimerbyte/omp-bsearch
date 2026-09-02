@@ -15,11 +15,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { ThemeColor } from "@oh-my-pi/pi-coding-agent/modes/theme/schema";
 import type { TextContent } from "@oh-my-pi/pi-ai";
-import { Text, Markdown } from "@oh-my-pi/pi-tui";
+import { Text } from "@oh-my-pi/pi-tui";
 import type { Component } from "@oh-my-pi/pi-tui";
 import type { ToolRenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-// ─────────────────────────────────────────────────────────────────────────────
 
 /** OMP v18 settings path — different from pi's ~/.pi/agent/settings.json */
 const SETTINGS_PATH = join(homedir(), ".omp", "agent", "settings.json");
@@ -325,7 +325,7 @@ function renderResult(
   theme: Theme,
   args?: BsearchParams,
 ): Component {
-  const fg = (k: import("@oh-my-pi/pi-coding-agent/modes/theme/schema").ThemeColor, s: string) => theme.fg(k, s);
+  const fg = (k: ThemeColor, s: string) => theme.fg(k, s);
   const bold = (s: string) => theme.bold(s);
   const dot = theme.sep.dot;
 
@@ -416,9 +416,7 @@ interface FramedBlockSpec {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildFramedBlock(spec: FramedBlockSpec, theme: Theme): Component {
-  const fg = (k: import("@oh-my-pi/pi-coding-agent/modes/theme/schema").ThemeColor, s: string) => theme.fg(k, s);
-  const width = 100;
-  const innerWidth = width - 2;
+  const fg = (k: ThemeColor, s: string) => theme.fg(k, s);
   const topL = "╭";
   const topR = "╮";
   const botL = "╰";
@@ -430,42 +428,60 @@ function buildFramedBlock(spec: FramedBlockSpec, theme: Theme): Component {
   const cap = sep.repeat(3);
 
   const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
-  const widthOf = (s: string): number => {
-    const stripped = s.replace(ANSI_RE, "");
-    return Array.from(stripped).length;
-  };
+  const visLen = (s: string): number => Array.from(s.replace(ANSI_RE, "")).length;
 
-  const fmtHeader = (header: string, meta: string): string => {
-    const top = `${topL}${cap} ${header}`;
-    const room = width - widthOf(top) - 1;
-    const m = room > 6 ? ` ${meta}` : "";
-    const padLen = Math.max(1, width - widthOf(top) - widthOf(m) - 1);
-    const pad = sep.repeat(padLen);
-    return fg("borderAccent", `${top}${pad}${m}${topR}`);
-  };
+  return {
+    render(width: number): readonly string[] {
+      const w = Math.max(40, Math.min(width, 140));
+      const innerWidth = w - 2;
+      const lines: string[] = [];
 
-  const fmtSectionBar = (label: string): string => {
-    const left = `${teeR}${cap} ${label}`;
-    const padLen = Math.max(1, width - widthOf(left) - widthOf(teeL));
-    return fg("borderAccent", `${left}${sep.repeat(padLen)}${teeL}`);
-  };
+      const headerLeft = `${topL}${cap} ${spec.header}`;
+      const metaSuffix = spec.headerMeta ? ` ${spec.headerMeta}` : "";
+      const headerLeftLen = visLen(headerLeft);
+      const metaSuffixLen = visLen(metaSuffix);
+      const headerPadLen = Math.max(1, w - headerLeftLen - metaSuffixLen - 1);
+      lines.push(fg("borderAccent", `${headerLeft}${sep.repeat(headerPadLen)}${metaSuffix}${topR}`));
 
-  const fmtLine = (line: string): string => {
-    const padLen = Math.max(1, innerWidth - widthOf(line) - 1);
-    return `${fg("borderAccent", vert)} ${line}${" ".repeat(padLen)}${fg("borderAccent", vert)}`;
-  };
+      for (const sec of spec.sections) {
+        const sectionLeft = `${teeR}${cap} ${sec.label}`;
+        const sectionLeftLen = visLen(sectionLeft);
+        const sectionPadLen = Math.max(1, w - sectionLeftLen - 1);
+        lines.push(fg("borderAccent", `${sectionLeft}${sep.repeat(sectionPadLen)}${teeL}`));
+        for (const contentLine of sec.lines) {
+          const contentBudget = innerWidth - 2;
+          const truncated = truncateToWidth(contentLine, contentBudget);
+          const padLen = Math.max(0, contentBudget - visLen(truncated));
+          lines.push(`${fg("borderAccent", vert)} ${truncated}${" ".repeat(padLen)} ${fg("borderAccent", vert)}`);
+        }
+      }
+      lines.push(fg("borderAccent", `${botL}${sep.repeat(w - 2)}${botR}`));
+      return lines;
+    },
+  } as unknown as Component;
+}
 
-  const fmtBottom = (): string =>
-    fg("borderAccent", `${botL}${sep.repeat(width - 2)}${botR}`);
-
-  const out: string[] = [];
-  out.push(fmtHeader(spec.header, spec.headerMeta ?? ""));
-  for (const sec of spec.sections) {
-    out.push(fmtSectionBar(sec.label));
-    for (const line of sec.lines) out.push(fmtLine(line));
+function truncateToWidth(s: string, max: number): string {
+  const ANSI_RE_LOCAL = /\x1b\[[0-9;?]*[A-Za-z]/g;
+  const stripped = s.replace(ANSI_RE_LOCAL, "");
+  if (Array.from(stripped).length <= max) return s;
+  let out = "";
+  let len = 0;
+  const chars = Array.from(s);
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i] ?? "";
+    if (ch === "\x1b") {
+      while (i < chars.length - 1 && chars[i]?.[0] === "\x1b") {
+        out += chars[i];
+        i++;
+      }
+      continue;
+    }
+    if (len >= max - 1) break;
+    out += ch;
+    len++;
   }
-  out.push(fmtBottom());
-  return new Text(out.join("\n"), 0, 0);
+  return out + "…";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
