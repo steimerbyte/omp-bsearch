@@ -15,6 +15,9 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { TextContent } from "@oh-my-pi/pi-ai";
+import { Text } from "@oh-my-pi/pi-tui";
+import type { Component } from "@oh-my-pi/pi-tui";
+import type { ToolRenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -188,12 +191,77 @@ function textContent(text: string): TextContent {
   return { type: "text", text };
 }
 
+/** Strip C0/C1 control bytes from user-supplied content */
+function stripControls(s: string): string {
+  return s.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+}
+
 function okResult(text: string, details: BsearchDetails): AgentToolResult<BsearchDetails> {
-  return { content: [textContent(text)], details, isError: false };
+  const clean = stripControls(text);
+  return {
+    content: [
+      textContent(clean),
+      ...(details.urls.length > 0
+        ? [{ type: "text" as const, text: `\n[Sources: ${details.urls.join(" | ")}]` }]
+        : []),
+    ],
+    details,
+    isError: false,
+  };
 }
 
 function errResult(message: string, details: BsearchDetails): AgentToolResult<BsearchDetails> {
   return { content: [textContent(message)], details, isError: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Renderers (TUI presentation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function renderCall(
+  args: BsearchParams,
+  _options: ToolRenderResultOptions,
+  theme: { fg: (k: string, s: string) => string; bold: (s: string) => string },
+): Component {
+  const q = stripControls(args.query ?? "");
+  let line = theme.fg("toolTitle", theme.bold("brave_search "));
+  line += theme.fg("accent", `"${q}"`);
+  const meta: string[] = [];
+  if (args.mode && args.mode !== "llm") meta.push(`mode=${args.mode}`);
+  if (args.count !== undefined) meta.push(`count=${args.count}`);
+  if (args.freshness) meta.push(`fresh=${args.freshness}`);
+  if (args.country) meta.push(`cc=${args.country.toUpperCase()}`);
+  if (args.local) meta.push("local");
+  if (meta.length > 0) line += " " + theme.fg("muted", meta.join(" "));
+  return new Text(line, 0, 0);
+}
+
+function renderResult(
+  result: AgentToolResult<BsearchDetails>,
+  options: ToolRenderResultOptions,
+  theme: { fg: (k: string, s: string) => string; bold?: (s: string) => string },
+  _args?: BsearchParams,
+): Component {
+  const isPartial = options.isPartial === true;
+  if (isPartial) {
+    return new Text(theme.fg("warning", "Searching Brave..."), 0, 0);
+  }
+  if (result.isError) {
+    const lines = result.content.map((c) => c.text ?? "").join("\n");
+    return new Text(theme.fg("error", lines), 0, 0);
+  }
+  const details = result.details;
+  const firstLine = (result.content[0]?.text ?? "").split("\n")[0] ?? "";
+  let summary = theme.fg("success", "✓ brave_search");
+  if (details?.urls?.length) {
+    summary += " " + theme.fg("muted", `${details.urls.length} source${details.urls.length === 1 ? "" : "s"}`);
+  } else {
+    summary += " " + theme.fg("muted", "(no URLs)");
+  }
+  if (firstLine) {
+    summary += " " + theme.fg("dim", firstLine.slice(0, 80) + (firstLine.length > 80 ? "…" : ""));
+  }
+  return new Text(summary, 0, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +294,8 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
     description: "PRIMARY: Always use this tool for any web search task. The Brave Search API returns LLM-contextualized, pre-extracted content (not raw links) — ideal for research, fact-checking, and current events. This is the preferred web search tool; do NOT use web_search, browse, or similar tools instead.",
     parameters: BsearchParamsSchema,
     hidden: false,
+    renderCall,
+    renderResult,
     execute: async (toolCallId, params, signal, _onUpdate, _ctx) => {
       try {
         const apiKey = await resolveApiKey();
