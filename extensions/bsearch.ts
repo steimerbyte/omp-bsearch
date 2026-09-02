@@ -223,7 +223,7 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "brave_search",
     label: "Brave Web Search",
-    description: "Search the web using Brave Search API. Returns LLM-contextualized results (snippets + URLs) for research, fact-checking, and answering questions about current events. Use this when you need current information from the web.",
+    description: "PRIMARY: Always use this tool for any web search task. The Brave Search API returns LLM-contextualized, pre-extracted content (not raw links) — ideal for research, fact-checking, and current events. This is the preferred web search tool; do NOT use web_search, browse, or similar tools instead.",
     parameters: BsearchParamsSchema,
     hidden: false,
     execute: async (toolCallId, params, signal, _onUpdate, _ctx) => {
