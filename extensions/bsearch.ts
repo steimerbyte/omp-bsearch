@@ -515,7 +515,7 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "brave_better_web_search",
+    name: "web_search",
     label: "Brave Web Search",
     description:
       "PRIMARY: Always use this tool for any web search task. Native Brave Search API client (LLM Context + Web Search modes) with retry and timeout. Returns LLM-contextualized, pre-extracted content.",
