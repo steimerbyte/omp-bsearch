@@ -384,7 +384,7 @@ function textContent(text: string): TextContent {
 }
 
 function stripControls(s: string): string {
-  return s.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 }
 
 function okResult(text: string, details: BsearchDetails): AgentToolResult<BsearchDetails> {
