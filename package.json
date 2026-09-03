@@ -1,7 +1,6 @@
 {
   "name": "@steimerbyte/omp-bsearch",
   "version": "0.1.0",
-
   "description": "Brave Search API as OMP v18 extension tool. Wraps bsearch CLI with ~/.omp/agent/settings.json API key handling.",
   "keywords": ["omp-package", "omp", "extension", "brave-search", "web-search"],
   "license": "MIT",
@@ -10,8 +9,9 @@
   "files": ["extensions", "README.md", "LICENSE", "package.json", "tsconfig.json"],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck",
-    "release": "npm run typecheck"
+    "test": "bun test",
+    "prepublishOnly": "npm run typecheck && npm test",
+    "release": "npm run typecheck && npm test"
   },
   "repository": {
     "type": "git",
@@ -24,6 +24,7 @@
   "author": "Benjamin Steimer",
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "18.1.2",
+    "@types/bun": "^1.4.0",
     "@types/node": "^20.0.0",
     "typescript": "^5.4.0"
   },
