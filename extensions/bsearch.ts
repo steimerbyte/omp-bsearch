@@ -22,6 +22,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
 const BRAVE_LLM_CONTEXT_URL = "https://api.search.brave.com/res/v1/llm/context";
 const BRAVE_WEB_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_RESULT_COUNT = 5;
+const DEFAULT_RENDER_WIDTH = 100;
 
 interface BsearchSettings {
   braveApiKey?: string;
@@ -178,6 +179,7 @@ export interface BsearchDetails {
   urls: string[];
   exitCode: number | null;
   mode: "llm" | "web";
+  response: unknown;
 }
 
 
@@ -313,152 +315,340 @@ async function performWebSearch(params: BsearchParams, apiKey: string): Promise<
   return (await response.json()) as WebSearchResponse;
 }
 
-// ─── Table rendering ──────────────────────────────────────────────────────
-// `mode` is passed by the caller: "llm" for LLM Context responses,
-// "web" for Web Search responses. The function inspects the top-level shape
-// of `data` and renders Markdown-style ASCII tables so terminal output stays
-// readable. No raw JSON is returned.
+// ─── Native-style sectioned rendering ────────────────────────────────────
+// Mirrors the layout used by the native `@oh-my-pi` web_search renderer:
+// header status line → Query / Answer / Sources / Metadata sections, all
+// wrapped in a rounded box frame. No pipe tables. All helpers are pure
+// string builders so they work without importing omp's internal pi-tui.
 
-type RenderMode = "llm" | "web";
 
-const FIELD_MAX = 80;       // clamp Title/URL/Snippets/Description/Name to this
-const COL_MAX = 200;        // hard ceiling on a computed column width
-const SNIPPET_SEP = " | ";  // separator between joined snippets
-
-function clamp(s: string, max: number): string {
-  if (s.length <= max) return s;
-  if (max <= 1) return s.slice(0, max);
-  return s.slice(0, max - 1) + "…";
+export function truncateToWidth(text: string, maxWidth: number): string {
+	if (maxWidth <= 0) return "";
+	if (text.length <= maxWidth) return text;
+	if (maxWidth <= 1) return text.slice(0, maxWidth);
+	return text.slice(0, maxWidth - 1) + "…";
 }
 
-function pad(s: string, width: number): string {
-  if (s.length >= width) return s;
-  return s + " ".repeat(width - s.length);
+export function getDomain(url: string): string {
+	try {
+		const u = new URL(url);
+		const host = u.hostname;
+		// Drop leading "www." so www.example.com → example.com (matches omp's getDomain).
+		return host.startsWith("www.") ? host.slice(4) : host;
+	} catch {
+		return "";
+	}
 }
 
-function joinSnippets(snippets: string[] | undefined): string {
-  if (!snippets || snippets.length === 0) return "";
-  return snippets.map((s) => clamp(stripControls(s), FIELD_MAX)).join(SNIPPET_SEP);
+export function formatCount(item: "source" | "line", n: number): string {
+	const word = n === 1 ? item : `${item}s`;
+	return `${n} ${word}`;
 }
 
-interface ColumnSpec {
-  header: string;
-  width: number;
+function visibleWidth(s: string): number {
+	// Defer to Bun.stringWidth when available — it follows Unicode 15 grapheme
+	// cluster rules and gives correct terminal width for emoji, CJK, and
+	// combining marks. Otherwise fall back to a length count that strips
+	// ANSI escapes.
+	try {
+		// @ts-expect-error Bun is a global in the omp runtime.
+		const w = Bun.stringWidth(s);
+		if (typeof w === "number" && Number.isFinite(w)) return w;
+	} catch {
+		// Fall through to the manual estimate.
+	}
+	let w = 0;
+	let inEscape = false;
+	for (let i = 0; i < s.length; i++) {
+		const ch = s[i]!;
+		if (inEscape) {
+			if (ch === "m") inEscape = false;
+			continue;
+		}
+		if (ch === "\u001b") {
+			inEscape = true;
+			continue;
+		}
+		w += 1;
+	}
+	return w;
 }
 
-function buildRows(
-  rows: string[][],
-  headers: string[],
-): { spec: ColumnSpec[]; lines: string[] } {
-  // Compute column widths: max(header, max(value)) capped to COL_MAX.
-  const widths = headers.map((h) => h.length);
-  for (const row of rows) {
-    for (let i = 0; i < headers.length; i++) {
-      const v = row[i] ?? "";
-      if (v.length > widths[i]!) widths[i] = v.length;
-    }
-  }
-  const spec: ColumnSpec[] = headers.map((h, i) => ({
-    header: h,
-    width: Math.min(Math.max(widths[i]!, h.length), COL_MAX),
-  }));
-
-  const renderRow = (cells: string[]): string =>
-    "| " + spec.map((c, i) => pad(cells[i] ?? "", c.width)).join(" | ") + " |";
-
-  const sep =
-    "|" + spec.map((c) => "-".repeat(c.width + 2)).join("|") + "|";
-
-  const lines: string[] = [renderRow(spec.map((c) => c.header)), sep];
-  for (const row of rows) lines.push(renderRow(row));
-  return { spec, lines };
+function padRight(s: string, width: number): string {
+	const w = visibleWidth(s);
+	if (w >= width) return s;
+	return s + " ".repeat(width - w);
 }
 
-function tableBlock(headers: string[], rows: string[][]): string {
-  if (rows.length === 0) return "No results";
-  return buildRows(rows, headers).lines.join("\n");
+// ─── Header / status line ───────────────────────────────────────────────
+const STATUS_ICONS = {
+	pending: "◌",
+	success: "●",
+	warning: "⚠",
+	error: "✗",
+} as const;
+
+type StatusKind = keyof typeof STATUS_ICONS;
+
+function renderStatusLine(
+	args: { icon: StatusKind; title: string; description?: string; meta?: string[] },
+	theme: Theme,
+): string {
+	const parts: string[] = [];
+	parts.push(theme.fg("dim", STATUS_ICONS[args.icon]));
+	parts.push(theme.bold(theme.fg("toolTitle", args.title)));
+	if (args.description) parts.push(theme.fg("accent", `"${args.description}"`));
+	if (args.meta && args.meta.length > 0) {
+		const sep = theme.fg("dim", " · ");
+		parts.push(sep + args.meta.map((m) => theme.fg("muted", m)).join(sep));
+	}
+	return parts.join(" ");
 }
 
-function renderLlmContextAsTable(data: unknown): string {
-  const d = data as LlmContextResponse;
-  const blocks: string[] = [];
+// ─── Box frame ──────────────────────────────────────────────────────────
+// Renders content into a rounded box with `╭─╮ │ ╰─╯` borders. Content lines
+// are wrapped to `width` columns (visible width). Empty content lines stay
+// blank for vertical breathing room.
 
-  const generic = d.grounding?.generic;
-  if (generic && generic.length > 0) {
-    const rows = generic.map((g, i) => [
-      String(i + 1),
-      clamp(stripControls(g.title ?? ""), FIELD_MAX),
-      clamp(stripControls(g.url ?? ""), FIELD_MAX),
-      joinSnippets(g.snippets),
-    ]);
-    blocks.push(tableBlock(["#", "Title", "URL", "Snippets"], rows));
-  }
+const BOX_HORIZ = "─";
+const BOX_VERT = "│";
+const BOX_TL = "╭";
+const BOX_TR = "╮";
+const BOX_BL = "╰";
+const BOX_BR = "╯";
 
-  const map = d.grounding?.map;
-  if (map && map.length > 0) {
-    const rows = map.map((m, i) => [
-      String(i + 1),
-      clamp(stripControls(m.name ?? ""), FIELD_MAX),
-      clamp(stripControls(m.url ?? ""), FIELD_MAX),
-      joinSnippets(m.snippets),
-    ]);
-    if (blocks.length > 0) blocks.push("");
-    blocks.push(tableBlock(["#", "Name", "URL", "Snippets"], rows));
-  }
-
-  const poi = d.grounding?.poi;
-  if (poi) {
-    const row = [
-      "1",
-      clamp(stripControls(poi.name ?? ""), FIELD_MAX),
-      clamp(stripControls(poi.url ?? ""), FIELD_MAX),
-      joinSnippets(poi.snippets),
-    ];
-    if (blocks.length > 0) blocks.push("");
-    blocks.push(tableBlock(["#", "Name", "URL", "Snippets"], [row]));
-  }
-
-  const sources = d.sources;
-  if (sources) {
-    const entries = Object.entries(sources);
-    if (entries.length > 0) {
-      const rows = entries.map(([url, src], i) => [
-        String(i + 1),
-        clamp(stripControls(src.hostname ?? ""), FIELD_MAX),
-        clamp(stripControls(url), FIELD_MAX),
-        clamp(stripControls((src.age ?? []).join(", ")), FIELD_MAX),
-      ]);
-      if (blocks.length > 0) blocks.push("");
-      blocks.push(tableBlock(["#", "Hostname", "URL", "Age"], rows));
-    }
-  }
-
-  return blocks.length > 0 ? blocks.join("\n") : "No results";
+function wrapLine(text: string, width: number): string[] {
+	if (width <= 0) return [""];
+	if (text.length === 0) return [""];
+	// Simple word wrap; tokens are space-separated, no ANSI-aware chopping.
+	const words = text.split(/(\s+)/);
+	const lines: string[] = [];
+	let cur = "";
+	for (const w of words) {
+		if (visibleWidth(cur + w) <= width) {
+			cur += w;
+		} else {
+			if (cur) lines.push(cur);
+			// Long word that exceeds the width on its own — hard truncate.
+			if (visibleWidth(w) > width) {
+				let rem = w;
+				while (visibleWidth(rem) > width) {
+					lines.push(truncateToWidth(rem, width));
+					rem = rem.slice(width);
+				}
+				cur = rem;
+			} else {
+				cur = w;
+			}
+		}
+	}
+	if (cur) lines.push(cur);
+	return lines.length > 0 ? lines : [""];
 }
 
-function renderWebSearchAsTable(data: unknown): string {
-  const d = data as WebSearchResponse;
-  const results = d.web?.results ?? [];
-  if (results.length === 0) return "No results";
-
-  const rows = results.map((r, i) => [
-    String(i + 1),
-    clamp(stripControls(r.title ?? ""), FIELD_MAX),
-    clamp(stripControls(r.url ?? ""), FIELD_MAX),
-    clamp(stripControls(r.description ?? ""), FIELD_MAX),
-    clamp(stripControls(r.age ?? ""), FIELD_MAX),
-  ]);
-
-  const block = tableBlock(["#", "Title", "URL", "Description", "Age"], rows);
-  const total = d.web?.total?.results;
-  const totalHint =
-    typeof total === "number" ? `\n\nTotal results reported by Brave: ${total}` : "";
-  return block + totalHint;
+function renderBoxFrame(
+	content: string[],
+	args: { header: string; width: number; padHeader?: boolean },
+	theme: Theme,
+): string {
+	const innerWidth = Math.max(10, args.width - 2); // exclude side borders ╭╮
+	const out: string[] = [];
+	const headerText = args.padHeader === false ? args.header : " " + args.header;
+	// Layout: ╭─ <header> ─...─╮
+	// Between ╭ and ╮ the row spans (innerWidth) chars. ╭─ uses 2 of them (╭ plus the leading dash).
+	// The trailing ╮ is 1 char outside that span — accounted for in totalWidth.
+	const headerCap = Math.max(1, innerWidth - 1);
+	const truncatedHeader = truncateToWidth(headerText, headerCap);
+	const headerFill = Math.max(0, innerWidth - 1 - visibleWidth(truncatedHeader));
+	out.push(
+		theme.fg("dim", BOX_TL + BOX_HORIZ) +
+			truncatedHeader +
+			theme.fg("dim", BOX_HORIZ.repeat(headerFill) + BOX_TR),
+	);
+	for (const line of content) {
+		for (const wrapped of wrapLine(line, innerWidth)) {
+			out.push(
+				theme.fg("dim", BOX_VERT) +
+					" " +
+					padRight(wrapped, innerWidth - 1) +
+					theme.fg("dim", BOX_VERT),
+			);
+		}
+	}
+	out.push(theme.fg("dim", BOX_BL + BOX_HORIZ.repeat(innerWidth) + BOX_BR));
+	return out.join("\n");
 }
 
-export function renderApiResponseAsTable(data: unknown, mode: RenderMode): string {
-  if (mode === "web") return renderWebSearchAsTable(data);
-  return renderLlmContextAsTable(data);
+// ─── Source tree list ───────────────────────────────────────────────────
+const MAX_COLLAPSED_ITEMS = 8;
+
+interface RenderSource {
+	title: string;
+	url: string;
+	domain?: string;
+	age?: string;
+}
+
+function renderTreeList(
+	items: RenderSource[],
+	args: { expanded: boolean; maxCollapsed: number; itemType: "source"; width: number },
+	theme: Theme,
+): string[] {
+	if (items.length === 0) {
+		return [theme.fg("muted", `No ${args.itemType}s returned`)];
+	}
+	const visible = args.expanded ? items.length : Math.min(items.length, args.maxCollapsed);
+	const remaining = items.length - visible;
+	const lines: string[] = [];
+	for (let i = 0; i < visible; i++) {
+		const isLast = i === visible - 1 && remaining === 0;
+		const branch = isLast ? "└─" : "├─";
+		const src = items[i]!;
+		const domain = src.domain ?? getDomain(src.url);
+		const metaParts: string[] = [];
+		if (domain) metaParts.push(theme.fg("dim", `(${domain})`));
+		if (src.age) metaParts.push(theme.fg("muted", src.age));
+		const metaSuffix = metaParts.length > 0
+			? " " + theme.fg("dim", "·") + " " + metaParts.join(" " + theme.fg("dim", "·") + " ")
+			: "";
+		const innerWidth = Math.max(10, args.width - 6); // border + "├─ "
+		const titleBudget = Math.max(8, innerWidth - visibleWidth(metaSuffix));
+		const titleText = src.title || src.url || "Untitled";
+		const title = theme.fg("accent", truncateToWidth(titleText, titleBudget));
+		lines.push(`  ${theme.fg("dim", branch)} ${title}${metaSuffix}`);
+	}
+	if (remaining > 0) {
+		lines.push(
+			"  " +
+				theme.fg("dim", "└─") +
+				" " +
+				theme.fg("muted", `+${formatCount(args.itemType, remaining)} more`),
+		);
+	}
+	return lines;
+}
+
+// ─── Source extraction ──────────────────────────────────────────────────
+export function extractLlmSources(data: unknown): RenderSource[] {
+	const d = data as LlmContextResponse | undefined;
+	if (!d) return [];
+	const sources: RenderSource[] = [];
+	for (const g of d.grounding?.generic ?? []) {
+		if (!g) continue;
+		sources.push({
+			title: stripControls(g.title ?? ""),
+			url: g.url ?? "",
+			age: d.sources?.[g.url ?? ""]?.age?.join(", "),
+		});
+	}
+	for (const m of d.grounding?.map ?? []) {
+		if (!m) continue;
+		sources.push({
+			title: stripControls(m.name ?? m.url ?? "Map result"),
+			url: m.url ?? "",
+			age: d.sources?.[m.url ?? ""]?.age?.join(", "),
+		});
+	}
+	if (d.grounding?.poi) {
+		const p = d.grounding.poi;
+		sources.push({
+			title: stripControls(p.name ?? "POI"),
+			url: p.url ?? "",
+			age: d.sources?.[p.url ?? ""]?.age?.join(", "),
+		});
+	}
+	return sources;
+}
+
+export function extractWebSources(data: unknown): RenderSource[] {
+	const d = data as WebSearchResponse | undefined;
+	if (!d?.web?.results) return [];
+	return d.web.results.map((r) => ({
+		title: stripControls(r.title ?? ""),
+		url: r.url ?? "",
+		age: r.age ? stripControls(r.age) : undefined,
+	}));
+}
+
+// ─── Render entry points ────────────────────────────────────────────────
+export interface RenderSearchOptions {
+	expanded: boolean;
+	width: number;
+}
+
+export function renderSearchCall(args: { query?: string }): string {
+	const q = truncateToWidth(stripControls(args.query ?? ""), 80);
+	return ` ${STATUS_ICONS.pending} ${q ? `"${q}"` : ""}`.trimEnd();
+}
+
+export function renderSearchResult(
+	mode: "llm" | "web",
+	response: unknown,
+	opts: RenderSearchOptions,
+	args: { query?: string },
+	theme: Theme,
+): string {
+	const isLlm = mode === "llm";
+	const sources = isLlm ? extractLlmSources(response) : extractWebSources(response);
+	const success = sources.length > 0;
+
+	const providerLabel = isLlm ? "Brave LLM Context" : "Brave Web Search";
+	const header = renderStatusLine(
+		{
+			icon: success ? "success" : "warning",
+			title: "Web Search",
+			description: providerLabel,
+			meta: [formatCount("source", sources.length)],
+		},
+		theme,
+	);
+
+	const innerWidth = Math.max(20, opts.width - 2);
+	const sections: string[] = [];
+
+	if (args.query) {
+		const q = truncateToWidth(stripControls(args.query), 80);
+		sections.push(theme.fg("toolTitle", "Query"));
+		sections.push(theme.fg("text", q));
+	}
+
+	sections.push(theme.fg("toolTitle", "Sources"));
+	for (const line of renderTreeList(
+		sources,
+		{ expanded: opts.expanded, maxCollapsed: MAX_COLLAPSED_ITEMS, itemType: "source", width: opts.width },
+		theme,
+)) {
+	sections.push(line);
+}
+
+	// Metadata block: provider label + source URL list (counts as provenance).
+	sections.push(theme.fg("toolTitle", "Metadata"));
+	sections.push(
+		`${theme.fg("muted", "Provider:")} ${theme.fg("text", providerLabel + (isLlm ? "" : " (Web)"))}`,
+	);
+	if (sources.length > 0 && sources.length <= MAX_COLLAPSED_ITEMS) {
+		const urls = sources.map((s) => s.url).filter((u) => u);
+		if (urls.length > 0) {
+			sections.push(`${theme.fg("muted", "URLs:")} ${theme.fg("dim", urls.join(", "))}`);
+		}
+	}
+
+	return renderBoxFrame(
+		sections,
+		{ header, width: opts.width },
+		theme,
+	);
+}
+
+// Legacy export kept for backward-compat with existing tests / imports.
+// (The old ASCII pipe-table renderer is gone; this returns plain text from
+// the raw API response using the same field order as before.)
+export function renderApiResponseAsTable(data: unknown, mode: "llm" | "web"): string {
+	const sources = mode === "llm" ? extractLlmSources(data) : extractWebSources(data);
+	if (sources.length === 0) return "No results";
+	return sources
+		.map((s, i) => `${i + 1}. ${s.title || s.url}` + (s.url ? ` — ${s.url}` : ""))
+		.join("\n");
 }
 
 
@@ -499,20 +689,20 @@ async function executeBsearch(rawParams: BsearchParams): Promise<AgentToolResult
       const data = await performLlmContext(params, apiKey);
       const text = renderApiResponseAsTable(data, "llm");
       const urls = extractUrls(text);
-      return okResult(text, { urls, exitCode: 0, mode: "llm" });
+      return okResult(text, { urls, exitCode: 0, mode: "llm", response: data });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message.includes("OPTION_NOT_IN_PLAN")) {
         const data = await performWebSearch(params, apiKey);
         const text = renderApiResponseAsTable(data, "web");
         const urls = extractUrls(text);
-        return okResult(text, { urls, exitCode: 0, mode: "web" });
+        return okResult(text, { urls, exitCode: 0, mode: "web", response: data });
       }
       throw err;
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return errResult(message, { urls: [], exitCode: null, mode: "llm" });
+    return errResult(message, { urls: [], exitCode: null, mode: "llm", response: null });
   }
 }
 
@@ -521,47 +711,59 @@ export function renderCall(
   _options: ToolRenderResultOptions,
   theme: Theme,
 ): Component {
-  const q = stripControls(args.query ?? "");
+  const q = truncateToWidth(stripControls(args.query ?? ""), 80);
   const meta: string[] = [];
-  if (args.count !== undefined) meta.push(`count=${args.count}`);
+  if (args.count !== undefined) meta.push(formatCount("source", args.count));
   if (args.freshness) meta.push(`fresh=${args.freshness}`);
-  if (args.city) meta.push(`city=${args.city}`);
+  if (args.country) meta.push(`country=${args.country.toUpperCase()}`);
   if (args.local) meta.push("local");
-  const metaSuffix = meta.length > 0 ? " " + theme.fg("muted", meta.join(" ")) : "";
-  const line = `${theme.fg("toolTitle", theme.bold("Brave Search"))} ${theme.fg("accent", `"${q}"`)}${metaSuffix}`;
-  return new Text(line, 0, 0);
+  const header = renderStatusLine(
+    {
+      icon: "pending",
+      title: "Web Search",
+      description: q ? `"${q}"` : "",
+      meta: meta.length > 0 ? meta : undefined,
+    },
+    theme,
+  );
+  return new Text(header, 0, 0);
 }
-
-const COLLAPSED_MAX_LINES = 80;
 
 export function renderResult(
   result: AgentToolResult<BsearchDetails>,
   options: ToolRenderResultOptions,
-  _theme: Theme,
+  theme: Theme,
   args?: BsearchParams,
 ): Component {
+  // Error path — error panel, no source extraction.
   if (result.isError) {
-    const msg = result.content.map((c) => ("text" in c ? c.text : "")).join("\n");
-    return new Text(`✗ ${msg}`, 0, 0);
+    const msg = result.content
+      .map((c) => ("text" in c ? c.text : ""))
+      .join("\n");
+    const header = renderStatusLine(
+      { icon: "error", title: "Web Search", description: "Brave Search" },
+      theme,
+    );
+    const body = renderBoxFrame(
+      [theme.fg("error", `Error: ${stripControls(msg)}`)],
+      { header, width: 80, padHeader: false },
+      theme,
+    );
+    return new Text(body, 0, 0);
   }
 
-  const textBlock = result.content.find((c) => c.type === "text");
-  const text = (textBlock && "text" in textBlock ? textBlock.text : "") ?? "";
-  const urls = result.details?.urls ?? [];
+  // Success path — extract from raw response (not the rendered text).
   const mode = result.details?.mode ?? "llm";
+  const response = result.details?.response;
 
-  const queryLabel = args?.query ? `"${args.query}"` : "web search";
-  const headerLine = `Brave Search (${mode}) — ${queryLabel} — ${urls.length} URLs`;
-
-  const allLines = text.split("\n");
-  let bodyLines = allLines;
-
-  if (!options.expanded && allLines.length > COLLAPSED_MAX_LINES) {
-    bodyLines = allLines.slice(0, COLLAPSED_MAX_LINES);
-    bodyLines.push(`   [+${allLines.length - COLLAPSED_MAX_LINES} more lines]`);
-  }
-
-  return new Text([headerLine, ...bodyLines].join("\n"), 0, 0);
+  const rendered = renderSearchResult(
+    mode,
+    response,
+    { expanded: options.expanded, width: DEFAULT_RENDER_WIDTH },
+    { query: args?.query },
+    theme,
+  );
+  return new Text(rendered, 0, 0);
 }
 
 export default function bsearchExtension(pi: ExtensionAPI): void {

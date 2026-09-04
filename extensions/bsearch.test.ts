@@ -7,9 +7,13 @@ import bsearchExtension, {
   type BsearchDetails,
   type BsearchParams,
   coerceParams,
-  renderApiResponseAsTable,
+  extractWebSources,
+  extractLlmSources,
+  formatCount,
+  getDomain,
   renderCall,
   renderResult,
+  truncateToWidth,
 } from "./bsearch.js";
 
 // ─── Stub theme ─────────────────────────────────────────────────────────────
@@ -32,19 +36,23 @@ function flatten(c: Component | undefined): string {
   return "";
 }
 
-function makeResult(text: string, opts?: { error?: boolean }): AgentToolResult<BsearchDetails> {
+function makeResult(
+  text: string,
+  opts: { error?: boolean; mode?: "llm" | "web"; response?: unknown } = {},
+): AgentToolResult<BsearchDetails> {
   return {
     content: [{ type: "text", text }],
-    details: { urls: ["https://example.com"], exitCode: 0, mode: "llm" as const },
-    isError: opts?.error ?? false,
+    details: {
+      urls: ["https://example.com"],
+      exitCode: 0,
+      mode: opts.mode ?? "llm",
+      response: opts.response ?? null,
+    },
+    isError: opts.error ?? false,
   };
 }
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
-
-
-
-// ─── renderApiResponseAsTable (ASCII table) ────────────────────────────────
 
 const SAMPLE_LLM_CONTEXT = {
   grounding: {
@@ -71,137 +79,291 @@ const SAMPLE_WEB_SEARCH = {
   },
 };
 
-describe("renderApiResponseAsTable", () => {
-  test("LLM mode: renders grounding.generic as ASCII table with #/Title/URL/Snippets columns", () => {
-    const text = renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm");
-    expect(text).toMatch(/\|\s*#\s*\|\s*Title\s*\|\s*URL\s*\|\s*Snippets\s*\|/);
-    expect(text).toContain("https://x.example/path");
-    expect(text).toContain("https://y.example");
-    expect(text).toContain("first snippet text | second snippet text");
-    expect(text).toContain("third snippet");
-    // Two data rows from the fixture (1 and 2 in the first data table).
-    expect(text).toMatch(/^\|\s*1\s*\|/m);
-    expect(text).toMatch(/^\|\s*2\s*\|/m);
+// ─── Helper unit tests ─────────────────────────────────────────────────────
+
+describe("truncateToWidth", () => {
+  test("returns input unchanged when shorter than max", () => {
+    expect(truncateToWidth("hello", 80)).toBe("hello");
   });
 
-  test("LLM mode: renders grounding.poi as a 1-row mini table", () => {
-    const text = renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm");
-    expect(text).toContain("Brandenburger Tor");
-    expect(text).toContain("historic landmark in Berlin");
-    // poi table has exactly one data row numbered "1" after a Name header.
-    const poiBlock = text.split("Name")[1] ?? "";
-    expect(poiBlock).toMatch(/^\|\s*1\s*\|/m);
+  test("truncates with ellipsis when over max", () => {
+    const out = truncateToWidth("a".repeat(100), 80);
+    expect(out.length).toBe(80);
+    expect(out.endsWith("…")).toBe(true);
   });
 
-  test("LLM mode: renders sources block as #/Hostname/URL/Age table", () => {
-    const text = renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm");
-    expect(text).toMatch(/\|\s*#\s*\|\s*Hostname\s*\|\s*URL\s*\|\s*Age\s*\|/);
-    expect(text).toContain("x.example");
-    expect(text).toContain("y.example");
+  test("clamps to 80 chars in renderCall-style usage", () => {
+    const long = "q".repeat(200);
+    expect(truncateToWidth(long, 80).length).toBe(80);
   });
 
-  test("LLM mode: empty grounding → 'No results'", () => {
-    expect(renderApiResponseAsTable({}, "llm")).toBe("No results");
-    expect(renderApiResponseAsTable({ grounding: {} }, "llm")).toBe("No results");
-  });
-
-  test("Web mode: renders results as #/Title/URL/Description/Age table", () => {
-    const text = renderApiResponseAsTable(SAMPLE_WEB_SEARCH, "web");
-    expect(text).toMatch(/\|\s*#\s*\|\s*Title\s*\|\s*URL\s*\|\s*Description\s*\|\s*Age\s*\|/);
-    expect(text).toContain("https://r1.example");
-    expect(text).toContain("first description");
-    expect(text).toContain("2 days ago");
-    expect(text).toContain("https://r3.example");
-    // Three data rows: numbered 1, 2, 3.
-    expect(text).toMatch(/^\|\s*1\s*\|/m);
-    expect(text).toMatch(/^\|\s*2\s*\|/m);
-    expect(text).toMatch(/^\|\s*3\s*\|/m);
-  });
-
-  test("Web mode: shows total hint from web.total.results", () => {
-    const text = renderApiResponseAsTable(SAMPLE_WEB_SEARCH, "web");
-    expect(text).toContain("Total results reported by Brave: 42");
-  });
-
-  test("Web mode: empty results → 'No results'", () => {
-    expect(renderApiResponseAsTable({}, "web")).toBe("No results");
-    expect(renderApiResponseAsTable({ web: { results: [] } }, "web")).toBe("No results");
-  });
-
-  test("clamps overlong fields to 80 chars (with ellipsis)", () => {
-    const long = "x".repeat(200);
-    const data = {
-      web: { results: [{ title: long, url: "https://long", description: "d" }] },
-    };
-    const text = renderApiResponseAsTable(data, "web");
-    const lines = text.split("\n");
-    const sepIdx = lines.findIndex((l) => l.startsWith("|---"));
-    const dataLine = lines[sepIdx + 1] ?? "";
-    // Title column is bounded; whole data line stays under a reasonable cap.
-    expect(dataLine.length).toBeLessThan(400);
-    expect(dataLine).toContain("…");
+  test("returns empty string when maxWidth is 0", () => {
+    expect(truncateToWidth("anything", 0)).toBe("");
   });
 });
 
-const ERROR_OUTPUT = "bsearch exited with code 1: network error";
+describe("getDomain", () => {
+  test("extracts hostname from a standard URL", () => {
+    expect(getDomain("https://example.com/path")).toBe("example.com");
+  });
+
+  test("strips leading 'www.' subdomain", () => {
+    expect(getDomain("https://www.example.com/path")).toBe("example.com");
+  });
+
+  test("preserves other subdomains", () => {
+    expect(getDomain("https://blog.example.com/post")).toBe("blog.example.com");
+  });
+
+  test("returns empty string for invalid URL", () => {
+    expect(getDomain("not a url")).toBe("");
+  });
+
+  test("handles non-www prefix hostnames without modification", () => {
+    expect(getDomain("https://api.github.com/repos")).toBe("api.github.com");
+  });
+});
+
+describe("formatCount", () => {
+  test("singular for count=1", () => {
+    expect(formatCount("source", 1)).toBe("1 source");
+  });
+
+  test("plural for count>1", () => {
+    expect(formatCount("source", 5)).toBe("5 sources");
+  });
+
+  test("zero is plural in English", () => {
+    expect(formatCount("source", 0)).toBe("0 sources");
+  });
+});
+
+describe("extractLlmSources", () => {
+  test("returns empty array for null/undefined data", () => {
+    expect(extractLlmSources(undefined)).toEqual([]);
+    expect(extractLlmSources(null)).toEqual([]);
+  });
+
+  test("extracts generic grounding entries", () => {
+    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
+    expect(sources.length).toBeGreaterThanOrEqual(2);
+    const titles = sources.map((s) => s.title);
+    expect(titles).toContain("X — long title for testing");
+    expect(titles).toContain("Y");
+  });
+
+  test("joins source age arrays into a comma-separated string", () => {
+    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
+    const x = sources.find((s) => s.url === "https://x.example/path");
+    expect(x?.age).toBe("2 days ago");
+  });
+
+  test("includes poi as a source entry", () => {
+    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
+    const poi = sources.find((s) => s.url === "https://poi.example");
+    expect(poi?.title).toBe("Brandenburger Tor");
+  });
+
+  test("extracts map grounding entries by their name", () => {
+    const data = {
+      grounding: {
+        map: [{ name: "Eiffel Tower", url: "https://map.example/eiffel", snippets: ["iconic Paris landmark"] }],
+      },
+    };
+    const sources = extractLlmSources(data);
+    expect(sources.length).toBe(1);
+    expect(sources[0]!.title).toBe("Eiffel Tower");
+  });
+});
+
+describe("extractWebSources", () => {
+  test("returns empty for missing web.results", () => {
+    expect(extractWebSources(undefined)).toEqual([]);
+    expect(extractWebSources({})).toEqual([]);
+  });
+
+  test("extracts each web result with title/url/age", () => {
+    const sources = extractWebSources(SAMPLE_WEB_SEARCH);
+    expect(sources.length).toBe(3);
+    expect(sources[0]!.title).toBe("R1");
+    expect(sources[0]!.age).toBe("2 days ago");
+    expect(sources[2]!.age).toBe("1 week ago");
+  });
+
+  test("age is undefined when not provided", () => {
+    const sources = extractWebSources(SAMPLE_WEB_SEARCH);
+    expect(sources[1]!.age).toBeUndefined();
+  });
+});
+
+// ─── renderCall (native status line) ───────────────────────────────────────
+
+describe("renderCall", () => {
+  test("renders pending icon + query in quotes", () => {
+    const out = flatten(renderCall({ query: "test" }, { expanded: false, isPartial: false }, stubTheme));
+    expect(out).toContain("◌");          // pending icon
+    expect(out).toContain("Web Search"); // title
+    expect(out).toContain('"test"');
+  });
+
+  test("truncates long queries to 80 characters", () => {
+    const long = "q".repeat(200);
+    const out = flatten(renderCall({ query: long }, { expanded: false, isPartial: false }, stubTheme));
+    // The rendered header is ` ◌ Web Search "qqqq…qqq"` — the quoted query
+    // captured between the first pair of quotes must be ≤ 80 chars (truncated
+    // by truncateToWidth, plus one trailing "…" if the input was longer).
+    const firstQuote = out.indexOf('"');
+    const secondQuote = out.indexOf('"', firstQuote + 1);
+    expect(firstQuote).toBeGreaterThan(-1);
+    expect(secondQuote).toBeGreaterThan(firstQuote);
+    const captured = out.slice(firstQuote + 1, secondQuote);
+    expect(captured.length).toBeLessThanOrEqual(80);
+  });
+  test("includes count=N meta when args.count is provided", () => {
+    const out = flatten(
+      renderCall({ query: "rust", count: 5 }, { expanded: false, isPartial: false }, stubTheme),
+    );
+    expect(out).toContain("5 sources");
+  });
+
+  test("shows singular '1 source' for count=1", () => {
+    const out = flatten(
+      renderCall({ query: "rust", count: 1 }, { expanded: false, isPartial: false }, stubTheme),
+    );
+    expect(out).toContain("1 source");
+    expect(out).not.toContain("1 sources");
+  });
+
+  test("includes freshness meta when set", () => {
+    const out = flatten(
+      renderCall({ query: "rust", freshness: "pw" }, { expanded: false, isPartial: false }, stubTheme),
+    );
+    expect(out).toContain("fresh=pw");
+  });
+
+  test("renders empty query gracefully", () => {
+    const out = flatten(renderCall({ query: "" }, { expanded: false, isPartial: false }, stubTheme));
+    expect(out).toContain("Web Search");
+    expect(out).toContain("◌");
+  });
+});
+
+// ─── renderResult (native sectioned box layout) ────────────────────────────
+
 describe("renderResult", () => {
   const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
   const expandedOpts: ToolRenderResultOptions = { expanded: true, isPartial: false };
 
-  test("renders header with mode + URL count (no 'sources' word in header line)", () => {
-    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
+  test("renders header with Web Search title + provider + source count", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
     const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    const headerLine = out.split("\n")[0] ?? "";
-    expect(headerLine).toContain("Brave Search (llm)");
-    expect(headerLine).toContain('"test"');
-    expect(headerLine).toMatch(/\d+ URLs?$/);
-    expect(headerLine).not.toContain("sources");
+    // Box frame top border
+    expect(out).toContain("╭─");
+    // Header text: status icon + title + provider label + count
+    expect(out).toContain("Web Search");
+    expect(out).toContain("Brave LLM Context");
+    expect(out).toMatch(/\d+ sources?/);
   });
 
-  test("includes the query in quotes in the rendered header", () => {
-    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
+  test("includes query section when args.query is provided", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
     const out = flatten(renderResult(result, opts, stubTheme, { query: "rust async" }));
-    expect(out).toContain('"rust async"');
+    expect(out).toContain("Query");
+    expect(out).toContain("rust async");
   });
 
-  test("renders table body line by line (no raw JSON, contains URL column)", () => {
-    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
+  test("omits query section when args.query is missing", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
     const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).toContain("https://x.example/path");
-    expect(out).toContain("https://y.example");
-    expect(out).not.toContain('"generic"');
-    expect(out).not.toContain('"snippets": [');
+    expect(out).not.toContain("Query");
   });
 
-  test("error result renders error marker", () => {
-    const result = makeResult(ERROR_OUTPUT, { error: true });
+  test("renders Sources section with tree branches for each source", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toContain("Sources");
+    expect(out).toMatch(/├─/);
+    expect(out).toContain("x.example");
+    expect(out).toContain("y.example");
+  });
+
+  test("includes domain in parentheses and age on the source line", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toMatch(/\(x\.example\)/);
+    expect(out).toContain("2 days ago");
+  });
+
+  test("renders Metadata section with Provider line", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toContain("Metadata");
+    expect(out).toContain("Provider:");
+  });
+
+  test("wraps content in box frame with bottom border", () => {
+    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toContain("╭─");
+    expect(out).toContain("│");
+    expect(out).toMatch(/╰─+╯/);
+  });
+
+  test("error result renders error panel with ✗ marker", () => {
+    const result = makeResult("network error", { error: true });
     const out = flatten(renderResult(result, opts, stubTheme));
     expect(out).toContain("✗");
+    expect(out).toContain("Error:");
+    expect(out).toContain("network error");
   });
 
-  test("expanded mode preserves all table content", () => {
-    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
-    const out = flatten(renderResult(result, expandedOpts, stubTheme));
-    expect(out).toContain("https://x.example/path");
-    expect(out).toContain("https://y.example");
+  test("zero sources → warning icon + '0 sources' meta", () => {
+    const emptyResp = { grounding: {} };
+    const result = makeResult("", { mode: "llm", response: emptyResp });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toContain("⚠");
+    expect(out).toContain("0 sources");
   });
-  test("collapsed mode truncates very long table output", () => {
-    // Build a fixture large enough to exceed COLLAPSED_MAX_LINES (80) of lines.
+
+  test("web mode renders Web Search provider label", () => {
+    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toContain("Brave Web Search");
+  });
+
+  test("web mode extracts sources from web.results (not from content text)", () => {
+    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toContain("R1");
+    expect(out).toContain("r1.example");
+    expect(out).toContain("r3.example");
+  });
+
+  test("expanded mode keeps all sources visible (no truncation of small lists)", () => {
+    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
+    const collapsedOut = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    const expandedOut = flatten(renderResult(result, expandedOpts, stubTheme, { query: "test" }));
+    // Both renderings include all 3 sources; expanded has no "+N more sources" hint.
+    expect(expandedOut).toContain("R1");
+    expect(expandedOut).toContain("R2");
+    expect(expandedOut).toContain("R3");
+    expect(expandedOut).not.toMatch(/\+\d+ sources? more/);
+    expect(collapsedOut).toContain("R1");
+  });
+
+  test("collapsed mode truncates source list with '+N more sources'", () => {
     const big = {
       web: {
-        results: Array.from({ length: 200 }, (_, i) => ({
+        results: Array.from({ length: 20 }, (_, i) => ({
           title: `R${i}`,
           url: `https://r${i}.example`,
-          description: "x".repeat(200),
-          age: "1 day ago",
+          description: "d",
         })),
       },
     };
-    const longText = renderApiResponseAsTable(big, "web");
-    const result = makeResult(longText);
-    const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).toContain("R0");
-    expect(out).toMatch(/\[\+\d+ more lines\]/);
+    const result = makeResult("", { mode: "web", response: big });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    expect(out).toMatch(/\+\d+ sources? more/);
   });
 });
 
