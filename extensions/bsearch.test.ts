@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Component } from "@oh-my-pi/pi-tui";
 import {
@@ -8,8 +8,15 @@ import {
   renderResult,
   renderSearchResult,
 } from "./bsearch.js";
+import { initThemeSync } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// OMP's `Markdown` component (and `getMarkdownTheme()`) read the global
+// `theme` instance — the runtime harness initializes it before invoking
+// `renderResult`. Tests don't go through it, so we initialize the theme
+// ourselves once for the whole suite.
+beforeAll(() => {
+  initThemeSync();
+});
 
 function flatten(c: Component | undefined): string {
   if (!c) return "";
@@ -262,25 +269,30 @@ describe("renderSearchResult — Web mode", () => {
   });
 });
 
-// ─── renderResult — plain Text wrapper ──────────────────────────────────────
-
-describe("renderResult — plain Text component wrapper", () => {
-  test("LLM success path returns a Text component containing the markdown", () => {
+describe("renderResult — Markdown component wrapper", () => {
+  test("LLM success path returns a Component rendering the search title and sections", () => {
     const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
     const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "capital of france" }));
-    expect(out).toContain("# Web Search (Brave LLM Context)");
-    expect(out).toContain("## Answer");
+    // The Markdown component strips leading `#` / `##` markers and styles the
+    // heading text. The plain text content still appears.
+    expect(out).toContain("Web Search");
+    expect(out).toContain("Answer");
     expect(out).toContain("The capital of France is Paris.");
-    expect(out).toContain("## Sources");
+    expect(out).toContain("Sources");
   });
 
-  test("LLM success path has no box frame or theme tokens", () => {
+  test("LLM success path adds ANSI escapes for syntax highlighting (no plain Text)", () => {
+    const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "x" }));
+    // The Markdown component must inject ANSI escapes for heading/link/etc.
+    expect(out).toContain("\u001b[");
+  });
+
+  test("renderResult never wraps the markdown in a box frame", () => {
     const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
     const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "x" }));
     expect(out).not.toMatch(/╭|╮|╰|╯/);
     expect(out).not.toContain("│");
-    // No ANSI escapes (we never inject theme tokens).
-    expect(out).not.toContain("\u001b[");
   });
 
   test("error path renders a plain 'Error: …' Text", () => {
@@ -297,8 +309,11 @@ describe("renderResult — plain Text component wrapper", () => {
   test("web mode renderResult pulls from result.details.response", () => {
     const result = makeResult({ mode: "web", response: WEB_RESPONSE });
     const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "x" }));
-    expect(out).toContain("- [R1](https://r1.example)");
-    expect(out).toContain("- [R3](https://r3.example)");
+    // The Markdown component renders list bullets with ANSI styling — the
+    // plain text "R1" / "R3" survives and so does the "more results" footer.
+    expect(out).toContain("R1");
+    expect(out).toContain("https://r1.example");
+    expect(out).toContain("R3");
     expect(out).toContain("…and 39 more results");
   });
 });
@@ -310,8 +325,8 @@ describe("coerceParams", () => {
     expect(coerceParams({ query: "x", count: 100 }).count).toBe(50);
   });
 
-  test("count: 0 → 1 (clamped to min)", () => {
-    expect(coerceParams({ query: "x", count: 0 }).count).toBe(1);
+  test("count: 0 → 5 (clamped to min floor)", () => {
+    expect(coerceParams({ query: "x", count: 0 }).count).toBe(5);
   });
 
   test("count: '5' → 5 (string-to-number coercion)", () => {
@@ -394,8 +409,8 @@ describe("coerceParams", () => {
     expect(coerceParams({ query: "x", city: "Berlin" }).city).toBe("Berlin");
   });
 
-  test("max_urls: 0 → 1 (clamped to min)", () => {
-    expect(coerceParams({ query: "x", max_urls: 0 }).max_urls).toBe(1);
+  test("max_urls: 0 → 5 (clamped to min floor)", () => {
+    expect(coerceParams({ query: "x", max_urls: 0 }).max_urls).toBe(5);
   });
 
   test("freshness: '2025-01-01to2025-12-31' → preserved (valid regex)", () => {
@@ -412,6 +427,99 @@ describe("coerceParams", () => {
   });
 });
 
+// ─── coerceParams — v2.5.0 count / max_urls floor (5) ──────────────────────
+
+describe("coerceParams — count / max_urls floor (5)", () => {
+  test("count: 0 → 5 (clamped up to floor)", () => {
+    expect(coerceParams({ query: "x", count: 0 }).count).toBe(5);
+  });
+
+  test("count: 3 → 5 (clamped up to floor)", () => {
+    expect(coerceParams({ query: "x", count: 3 }).count).toBe(5);
+  });
+
+  test("count: 4 → 5 (clamped up to floor)", () => {
+    expect(coerceParams({ query: "x", count: 4 }).count).toBe(5);
+  });
+
+  test("count: '1' → 5 (string coerced + clamped up to floor)", () => {
+    expect(coerceParams({ query: "x", count: "1" }).count).toBe(5);
+  });
+
+  test("count: undefined → 5 (default floor)", () => {
+    expect(coerceParams({ query: "x" }).count).toBe(5);
+  });
+
+  test("count: 5 → 5 (exact floor preserved)", () => {
+    expect(coerceParams({ query: "x", count: 5 }).count).toBe(5);
+  });
+
+  test("count: 7 → 7 (above floor preserved)", () => {
+    expect(coerceParams({ query: "x", count: 7 }).count).toBe(7);
+  });
+
+  test("max_urls: 2 → 5 (clamped up to floor)", () => {
+    expect(coerceParams({ query: "x", max_urls: 2 }).max_urls).toBe(5);
+  });
+
+  test("max_urls: undefined → 5 (default floor)", () => {
+    expect(coerceParams({ query: "x" }).max_urls).toBe(5);
+  });
+});
+
+// ─── Markdown output integration (v2.5.0) ──────────────────────────────────
+
+describe("Markdown output", () => {
+  test("renderSearchResult output contains the canonical section markers", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "capital of france" });
+    expect(out).toContain("## Query");
+    expect(out).toContain("## Answer");
+    expect(out).toContain("## Sources");
+  });
+
+  test("renderSearchResult renders links as [Title](url)", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    expect(out).toContain("[France — Wikipedia](https://w.example/wiki)");
+    expect(out).toContain("[Paris \\| Britannica](https://b.example/paris)");
+  });
+
+  test("Markdown includes sources[url].snippet (clean text), not raw grounding snippets", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    // Clean snippet text from sources[url].snippet
+    expect(out).toContain("France is a country in Europe. Its capital is Paris.");
+    expect(out).toContain("Paris, city and capital of France.");
+    // Messy grounding.generic[].snippets[] must NOT appear
+    expect(out).not.toContain("# mess");
+    expect(out).not.toContain("more mess");
+  });
+
+  test("renderResult returns a Markdown Component that renders to non-empty lines", () => {
+    const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
+    const c = renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "x" });
+    expect(c).toBeDefined();
+    // The render() path is the only consumer-facing surface — render the
+    // component to a wide terminal and verify it yields strings, no throw.
+    const out = flatten(c);
+    expect(typeof out).toBe("string");
+    expect(out.length).toBeGreaterThan(0);
+    // Sanity: the rendered markdown must include the section text — the
+    // Markdown component strips the leading `#` markers, so we match the
+    // plain heading text instead.
+    expect(out).toContain("Sources");
+    expect(out).toContain("Web Search");
+  });
+
+  test("renderResult output contains canonical markdown sections even after rendering", () => {
+    const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "capital of france" }));
+    expect(out).toContain("Web Search");
+    expect(out).toContain("Query");
+    expect(out).toContain("Answer");
+    expect(out).toContain("Sources");
+    // Clean snippet text from sources[url].snippet must survive the Markdown render pass
+    expect(out).toContain("France is a country in Europe. Its capital is Paris.");
+  });
+});
 // ─── Module exports (regression) ────────────────────────────────────────────
 
 describe("module exports", () => {

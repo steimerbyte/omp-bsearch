@@ -6,11 +6,14 @@
  * github.com/steimerbyte/bsearch-cli/index.js.
  *
  * Renderer policy: take the raw Brave API response JSON, convert it to a
- * clean Markdown string, and push it into a single plain `Text` component.
- * No box frame, no theme-driven sections, no `╭─╮` borders. Sources use the
- * `sources[url]` map's clean `snippet` (NOT the messy
- * `grounding.generic[].snippets[]` chunks) and the first element of
- * `sources[url].age[]` as-is.
+ * clean Markdown string, and push it into OMP's `Markdown` TUI component
+ * (`@oh-my-pi/pi-tui`) with the active markdown theme. The component wires
+ * `highlightCode` under the hood for fenced code blocks, with graceful
+ * fallback when the language tag is missing or unknown. No box frame, no
+ * `╭─╮` borders. Sources use the `sources[url]` map's clean `snippet`
+ * (NOT the messy `grounding.generic[].snippets[]` chunks) and the first
+ * element of `sources[url].age[]` as-is. The default `count` /
+ * `max_urls` floor is 5 — anything below is clamped up to 5.
  */
 
 import { join } from "node:path";
@@ -20,8 +23,9 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/exten
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { TextContent } from "@oh-my-pi/pi-ai";
-import { Text } from "@oh-my-pi/pi-tui";
+import { Markdown, Text } from "@oh-my-pi/pi-tui";
 import type { Component } from "@oh-my-pi/pi-tui";
+import { getMarkdownTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 const SETTINGS_PATH = join(homedir(), ".omp", "agent", "settings.json");
 const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
@@ -118,7 +122,7 @@ export function coerceParams(raw: unknown): BsearchParams {
 
   const query = coerceString(r.query, 500);
 
-  const count = coerceNumber(r.count, DEFAULT_RESULT_COUNT, 1, 50);
+  const count = coerceNumber(r.count, DEFAULT_RESULT_COUNT, 5, 50);
   let offset: number | undefined;
   if (r.offset !== undefined) {
     const n = typeof r.offset === "number" && Number.isFinite(r.offset)
@@ -141,7 +145,7 @@ export function coerceParams(raw: unknown): BsearchParams {
   );
 
   const maxTokens = coerceNumber(r.max_tokens, 8192, 1024, 32768);
-  const maxUrls = coerceNumber(r.max_urls, DEFAULT_RESULT_COUNT, 1, 50);
+  const maxUrls = coerceNumber(r.max_urls, DEFAULT_RESULT_COUNT, 5, 50);
 
   const threshold = coerceEnum(
     r.threshold,
@@ -551,7 +555,7 @@ export function renderResult(
   const mode = result.details?.mode ?? "llm";
   const response = result.details?.response;
   const markdown = renderSearchResult(mode, response, { query: args?.query });
-  return new Text(stripControls(markdown), 0, 0);
+  return new Markdown(stripControls(markdown), 0, 0, getMarkdownTheme());
 }
 
 export default function bsearchExtension(pi: ExtensionAPI): void {
