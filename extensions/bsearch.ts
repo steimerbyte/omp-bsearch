@@ -424,33 +424,46 @@ const BOX_TR = "╮";
 const BOX_BL = "╰";
 const BOX_BR = "╯";
 
-function wrapLine(text: string, width: number): string[] {
+export function stripHtml(s: string): string {
+	if (typeof s !== "string") return "";
+	// Remove HTML tags, then decode the common entities that survive.
+	const noTags = s.replace(/<[^>]*>/g, "");
+	return noTags
+		.replace(/&nbsp;/g, " ")
+		.replace(/&quot;/g, "\"")
+		.replace(/&#39;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
+}
+
+export function wrapLine(text: string, width: number): string[] {
 	if (width <= 0) return [""];
-	if (text.length === 0) return [""];
-	// Simple word wrap; tokens are space-separated, no ANSI-aware chopping.
-	const words = text.split(/(\s+)/);
+	if (text.length === 0) return [];
+	// Word-aware wrap: tokens are whitespace-separated runs; emit a new line
+	// whenever adding the next token would exceed `width`. Tokens longer than
+	// `width` are emitted as-is on their own line (never split mid-word).
+	const tokens = text.split(/(\s+)/);
 	const lines: string[] = [];
 	let cur = "";
-	for (const w of words) {
-		if (visibleWidth(cur + w) <= width) {
-			cur += w;
+	for (const tok of tokens) {
+		if (tok.length === 0) continue;
+		if (/^\s+$/.test(tok)) {
+			// Preserve trailing whitespace at the end of a logical line — never
+			// merge it into the next line. Skip if no current content yet.
+			if (cur) cur += tok;
+			continue;
+		}
+		const candidate = cur + tok;
+		if (visibleWidth(candidate) <= width) {
+			cur = candidate;
 		} else {
-			if (cur) lines.push(cur);
-			// Long word that exceeds the width on its own — hard truncate.
-			if (visibleWidth(w) > width) {
-				let rem = w;
-				while (visibleWidth(rem) > width) {
-					lines.push(truncateToWidth(rem, width));
-					rem = rem.slice(width);
-				}
-				cur = rem;
-			} else {
-				cur = w;
-			}
+			if (cur.trim().length > 0) lines.push(cur.trimEnd());
+			cur = tok;
 		}
 	}
-	if (cur) lines.push(cur);
-	return lines.length > 0 ? lines : [""];
+	if (cur.trim().length > 0) lines.push(cur.trimEnd());
+	return lines;
 }
 
 function renderBoxFrame(
@@ -555,6 +568,8 @@ function renderTreeList(
 export function extractLlmSources(data: unknown): RenderSource[] {
 	const d = data as LlmContextResponse | undefined;
 	if (!d) return [];
+	const cleanSnippet = (s: string | undefined): string | undefined =>
+		s === undefined ? undefined : stripControls(stripHtml(s));
 	const sources: RenderSource[] = [];
 	for (const g of d.grounding?.generic ?? []) {
 		if (!g) continue;
@@ -563,7 +578,7 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 			title: stripControls(g.title ?? ""),
 			url: g.url ?? "",
 			age: d.sources?.[g.url ?? ""]?.age?.join(", "),
-			snippet: firstSnippet !== undefined ? stripControls(firstSnippet) : undefined,
+			snippet: cleanSnippet(firstSnippet),
 		});
 	}
 	for (const m of d.grounding?.map ?? []) {
@@ -573,7 +588,7 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 			title: stripControls(m.name ?? m.url ?? "Map result"),
 			url: m.url ?? "",
 			age: d.sources?.[m.url ?? ""]?.age?.join(", "),
-			snippet: firstSnippet !== undefined ? stripControls(firstSnippet) : undefined,
+			snippet: cleanSnippet(firstSnippet),
 		});
 	}
 	if (d.grounding?.poi) {
@@ -583,7 +598,7 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 			title: stripControls(p.name ?? "POI"),
 			url: p.url ?? "",
 			age: d.sources?.[p.url ?? ""]?.age?.join(", "),
-			snippet: firstSnippet !== undefined ? stripControls(firstSnippet) : undefined,
+			snippet: cleanSnippet(firstSnippet),
 		});
 	}
 	return sources;
@@ -592,11 +607,19 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 export function extractWebSources(data: unknown): RenderSource[] {
 	const d = data as WebSearchResponse | undefined;
 	if (!d?.web?.results) return [];
+	const cleanSnippet = (s: string | undefined): string | undefined =>
+		s === undefined ? undefined : stripControls(stripHtml(s));
+	const cleanExtras = (xs: unknown): string[] | undefined => {
+		if (!Array.isArray(xs)) return undefined;
+		const out: string[] = [];
+		for (const x of xs) {
+			if (typeof x === "string") out.push(stripControls(stripHtml(x)));
+		}
+		return out.length > 0 ? out : undefined;
+	};
 	return d.web.results.map((r) => {
-		const description = typeof r.description === "string" ? stripControls(r.description) : undefined;
-		const extras = Array.isArray(r.extra_snippets)
-			? r.extra_snippets.filter((s): s is string => typeof s === "string").map(stripControls)
-			: undefined;
+		const description = typeof r.description === "string" ? stripControls(stripHtml(r.description)) : undefined;
+		const extras = cleanExtras(r.extra_snippets);
 		const favicon = typeof r.meta_url?.favicon === "string" ? stripControls(r.meta_url.favicon) : undefined;
 		const hostname = typeof r.meta_url?.hostname === "string" ? r.meta_url.hostname : undefined;
 		return {

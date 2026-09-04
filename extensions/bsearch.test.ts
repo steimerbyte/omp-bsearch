@@ -13,7 +13,9 @@ import bsearchExtension, {
   getDomain,
   renderCall,
   renderResult,
+  stripHtml,
   truncateToWidth,
+  wrapLine,
 } from "./bsearch.js";
 
 // ─── Stub theme ─────────────────────────────────────────────────────────────
@@ -725,5 +727,213 @@ describe("renderResult — Web snippets and total count", () => {
     expect(out).toContain("Sources");
     expect(out).toMatch(/╭─/);
     expect(out).not.toContain("more results");
+  });
+});
+
+
+// ─── stripHtml — HTML entity / tag stripping ───────────────────────────────
+describe("stripHtml", () => {
+  test("removes HTML tags including <strong>", () => {
+    expect(stripHtml("<strong>Tokio futures</strong> support epoll/kqueue/iocp")).toBe(
+      "Tokio futures support epoll/kqueue/iocp",
+    );
+  });
+
+  test("decodes &amp; entity", () => {
+    expect(stripHtml("Q&amp;A about Tokio")).toBe("Q&A about Tokio");
+  });
+
+  test("decodes &quot; entity", () => {
+    expect(stripHtml("she said &quot;hi&quot;")).toBe('she said "hi"');
+  });
+
+  test("decodes &lt;, &gt;, &#39;, &nbsp; entities", () => {
+    expect(stripHtml("&lt;a&gt;&#39;ok&#39;&nbsp;end")).toBe("<a>'ok' end");
+  });
+
+  test("strips tags AND decodes entities when both are present", () => {
+    expect(stripHtml("<em>Q&amp;A</em>")).toBe("Q&A");
+  });
+
+  test("returns empty string for non-string input", () => {
+    expect(stripHtml(undefined as unknown as string)).toBe("");
+    expect(stripHtml(null as unknown as string)).toBe("");
+    expect(stripHtml(42 as unknown as string)).toBe("");
+  });
+
+  test("leaves plain text unchanged", () => {
+    expect(stripHtml("no markup here")).toBe("no markup here");
+  });
+});
+
+// ─── wrapLine — word-aware wrap ─────────────────────────────────────────────
+describe("wrapLine", () => {
+  test("returns empty array for empty input", () => {
+    expect(wrapLine("", 80)).toEqual([]);
+  });
+
+  test("returns single token when it fits", () => {
+    expect(wrapLine("hello world", 80)).toEqual(["hello world"]);
+  });
+
+  test("splits at whitespace boundaries to respect width", () => {
+    const out = wrapLine("aa bb cc dd ee", 8);
+    expect(out).toEqual(["aa bb cc", "dd ee"]);
+    for (const line of out) expect(line.length).toBeLessThanOrEqual(8);
+  });
+
+  test("long single token is NOT split mid-word — emitted on its own line", () => {
+    // Build a long identifier-like token programmatically so the test
+    // does not depend on a particular literal value being preserved.
+    const token = "a".repeat(15) + "b".repeat(15);
+    const out = wrapLine(`${token} tail`, 10);
+    // The long token must appear intact on a line by itself.
+    expect(out).toContain(token);
+    expect(out.some((l) => l === token)).toBe(true);
+    // No line should be a partial subset of the token (a mid-word break).
+    for (const line of out) {
+      expect(line === token || line === "tail" || /^a+b+$/.test(line)).toBe(true);
+    }
+  });
+
+  test("long URL token is NOT split mid-word", () => {
+    const url = "https://example.com/very/long/path/that/exceeds/width";
+    const out = wrapLine(`click ${url} now`, 20);
+    expect(out).toContain(url);
+    // No line should be a mid-token fragment like "path/that/exceeds/width"
+    // stripped of the URL prefix.
+    for (const line of out) {
+      expect(line === "click" || line.startsWith("click ") || line === url || line === "now").toBe(true);
+    }
+  });
+
+  test("hyphenated phrase 'Tokio's' is not broken across lines", () => {
+    const text = "Tokio's runtime is the only isolated function";
+    const out = wrapLine(text, 14);
+    // No line should start with a broken fragment that is clearly a
+    // continuation of a wrapped hyphenated phrase (e.g. just "s" or
+    // "'s runtime" — these were the old word-wrap bug).
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i]).not.toMatch(/^s\s/); // would mean "s" was torn off "Tokio's"
+      expect(out[i]).not.toMatch(/^'s\s/); // would mean "'s" was torn off
+    }
+    // The token "Tokio's" must appear as a whole on some line.
+    expect(out.some((l) => l.includes("Tokio's"))).toBe(true);
+    // The full text content must be preserved across lines.
+    expect(out.join(" ")).toBe(text);
+  });
+
+  test("id-like token 'epoll/kqueue/iocp' is not split", () => {
+    const text = "runtime uses epoll/kqueue/iocp under the hood";
+    const out = wrapLine(text, 16);
+    expect(out).toContain("epoll/kqueue/iocp");
+    for (const line of out) {
+      const firstWord = line.split(/\s+/)[0]!;
+      expect(firstWord).not.toBe("kqueue/iocp");
+      expect(firstWord).not.toBe("iocp");
+    }
+  });
+
+  test("width <= 0 returns single empty line", () => {
+    expect(wrapLine("hello", 0)).toEqual([""]);
+    expect(wrapLine("hello", -1)).toEqual([""]);
+  });
+});
+
+// ─── Snippet cleaning — HTML stripping reaches the extractor output ────────
+describe("extractWebSources — HTML stripping on description & extra_snippets", () => {
+  test("description HTML tags are stripped", () => {
+    const sources = extractWebSources({
+      web: {
+        results: [
+          {
+            title: "R",
+            url: "https://r.example",
+            description: "<strong>Tokio futures</strong> support epoll/kqueue/iocp",
+          },
+        ],
+      },
+    });
+    expect(sources[0]?.snippet).toBe("Tokio futures support epoll/kqueue/iocp");
+    expect(sources[0]?.snippet).not.toMatch(/<[^>]+>/);
+  });
+
+  test("description HTML entities are decoded", () => {
+    const sources = extractWebSources({
+      web: {
+        results: [
+          {
+            title: "R",
+            url: "https://r.example",
+            description: "Q&amp;A:&nbsp;&quot;async runtime&quot;",
+          },
+        ],
+      },
+    });
+    expect(sources[0]?.snippet).toBe('Q&A: "async runtime"');
+  });
+
+  test("extra_snippets HTML tags and entities are stripped", () => {
+    const sources = extractWebSources({
+      web: {
+        results: [
+          {
+            title: "R",
+            url: "https://r.example",
+            description: "d",
+            extra_snippets: ["<em>foo</em> &amp; <code>bar</code>", "Q&quot;Z"],
+          },
+        ],
+      },
+    });
+    expect(sources[0]?.extraSnippets).toEqual(["foo & bar", "Q\"Z"]);
+  });
+});
+
+describe("extractLlmSources — HTML stripping on snippets", () => {
+  test("snippet HTML tags and entities are stripped", () => {
+    const sources = extractLlmSources({
+      grounding: {
+        generic: [
+          {
+            title: "T",
+            url: "https://t.example",
+            snippets: ["<strong>Tokio</strong> &amp; <em>Rust</em>"],
+          },
+        ],
+      },
+    });
+    expect(sources[0]?.snippet).toBe("Tokio & Rust");
+  });
+});
+
+// ─── Renderer integration — long token wrap doesn't fragment the snippet ───
+describe("renderResult — long-token snippet stays readable", () => {
+  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
+
+  test("long URL in web snippet is not broken mid-token across box lines", () => {
+    const longUrl = "https://example.com/very/long/path/that/exceeds/the/inner/width/budget";
+    const result = makeResult("", {
+      mode: "web",
+      response: {
+        web: {
+          results: [
+            {
+              title: "R1",
+              url: "https://r1.example",
+              description: `See ${longUrl} for details`,
+            },
+          ],
+        },
+      },
+    });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).toContain(longUrl);
+    // No line in the rendered output should start with a mid-token fragment
+    // such as "path/that/exceeds/..." stripped of the URL prefix.
+    for (const line of out.split("\n")) {
+      expect(line).not.toMatch(/\|\s+path\/that\/exceeds/);
+      expect(line).not.toMatch(/\|\s+exceeds\/the\/inner/);
+    }
   });
 });
