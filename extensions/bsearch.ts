@@ -235,6 +235,8 @@ async function fetchWithRetry(
 }
 
 interface LlmContextResponse {
+  answer?: string;
+  follow_up_questions?: string[];
   grounding?: {
     generic?: Array<{ title: string; url: string; snippets?: string[] }>;
     map?: Array<{ name: string; url: string; snippets?: string[] }>;
@@ -285,11 +287,17 @@ async function performLlmContext(params: BsearchParams, apiKey: string): Promise
 
   return (await response.json()) as LlmContextResponse;
 }
-
 interface WebSearchResponse {
   web?: {
-    results: Array<{ title: string; url: string; description?: string; age?: string }>;
-    total?: { results: number };
+    results: Array<{
+      title: string;
+      url: string;
+      description?: string;
+      extra_snippets?: string[];
+      age?: string;
+      meta_url?: { hostname?: string; favicon?: string; title?: string };
+    }>;
+    total?: { results?: number };
   };
 }
 
@@ -351,7 +359,6 @@ function visibleWidth(s: string): number {
 	// combining marks. Otherwise fall back to a length count that strips
 	// ANSI escapes.
 	try {
-		// @ts-expect-error Bun is a global in the omp runtime.
 		const w = Bun.stringWidth(s);
 		if (typeof w === "number" && Number.isFinite(w)) return w;
 	} catch {
@@ -483,10 +490,13 @@ function renderBoxFrame(
 const MAX_COLLAPSED_ITEMS = 8;
 
 interface RenderSource {
-	title: string;
-	url: string;
-	domain?: string;
-	age?: string;
+  title: string;
+  url: string;
+  domain?: string;
+  age?: string;
+  snippet?: string;
+  extraSnippets?: string[];
+  favicon?: string;
 }
 
 function renderTreeList(
@@ -500,6 +510,7 @@ function renderTreeList(
 	const visible = args.expanded ? items.length : Math.min(items.length, args.maxCollapsed);
 	const remaining = items.length - visible;
 	const lines: string[] = [];
+	const showExtras = args.expanded || items.length <= 3;
 	for (let i = 0; i < visible; i++) {
 		const isLast = i === visible - 1 && remaining === 0;
 		const branch = isLast ? "└─" : "├─";
@@ -516,6 +527,20 @@ function renderTreeList(
 		const titleText = src.title || src.url || "Untitled";
 		const title = theme.fg("accent", truncateToWidth(titleText, titleBudget));
 		lines.push(`  ${theme.fg("dim", branch)} ${title}${metaSuffix}`);
+		// Snippet (dim/muted, wrapped, indented to align under title).
+		if (src.snippet) {
+			for (const wrapped of wrapLine(src.snippet, innerWidth)) {
+				lines.push(`      ${theme.fg("muted", wrapped)}`);
+			}
+		}
+		// Extra snippets only when expanded OR small list.
+		if (showExtras && src.extraSnippets) {
+			for (const extra of src.extraSnippets) {
+				for (const wrapped of wrapLine(extra, innerWidth)) {
+					lines.push(`      ${theme.fg("dim", wrapped)}`);
+				}
+			}
+		}
 	}
 	if (remaining > 0) {
 		lines.push(
@@ -527,34 +552,38 @@ function renderTreeList(
 	}
 	return lines;
 }
-
-// ─── Source extraction ──────────────────────────────────────────────────
 export function extractLlmSources(data: unknown): RenderSource[] {
 	const d = data as LlmContextResponse | undefined;
 	if (!d) return [];
 	const sources: RenderSource[] = [];
 	for (const g of d.grounding?.generic ?? []) {
 		if (!g) continue;
+		const firstSnippet = Array.isArray(g.snippets) && g.snippets.length > 0 ? g.snippets[0] : undefined;
 		sources.push({
 			title: stripControls(g.title ?? ""),
 			url: g.url ?? "",
 			age: d.sources?.[g.url ?? ""]?.age?.join(", "),
+			snippet: firstSnippet !== undefined ? stripControls(firstSnippet) : undefined,
 		});
 	}
 	for (const m of d.grounding?.map ?? []) {
 		if (!m) continue;
+		const firstSnippet = Array.isArray(m.snippets) && m.snippets.length > 0 ? m.snippets[0] : undefined;
 		sources.push({
 			title: stripControls(m.name ?? m.url ?? "Map result"),
 			url: m.url ?? "",
 			age: d.sources?.[m.url ?? ""]?.age?.join(", "),
+			snippet: firstSnippet !== undefined ? stripControls(firstSnippet) : undefined,
 		});
 	}
 	if (d.grounding?.poi) {
 		const p = d.grounding.poi;
+		const firstSnippet = Array.isArray(p.snippets) && p.snippets.length > 0 ? p.snippets[0] : undefined;
 		sources.push({
 			title: stripControls(p.name ?? "POI"),
 			url: p.url ?? "",
 			age: d.sources?.[p.url ?? ""]?.age?.join(", "),
+			snippet: firstSnippet !== undefined ? stripControls(firstSnippet) : undefined,
 		});
 	}
 	return sources;
@@ -563,11 +592,23 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 export function extractWebSources(data: unknown): RenderSource[] {
 	const d = data as WebSearchResponse | undefined;
 	if (!d?.web?.results) return [];
-	return d.web.results.map((r) => ({
-		title: stripControls(r.title ?? ""),
-		url: r.url ?? "",
-		age: r.age ? stripControls(r.age) : undefined,
-	}));
+	return d.web.results.map((r) => {
+		const description = typeof r.description === "string" ? stripControls(r.description) : undefined;
+		const extras = Array.isArray(r.extra_snippets)
+			? r.extra_snippets.filter((s): s is string => typeof s === "string").map(stripControls)
+			: undefined;
+		const favicon = typeof r.meta_url?.favicon === "string" ? stripControls(r.meta_url.favicon) : undefined;
+		const hostname = typeof r.meta_url?.hostname === "string" ? r.meta_url.hostname : undefined;
+		return {
+			title: stripControls(r.title ?? ""),
+			url: r.url ?? "",
+			age: r.age ? stripControls(r.age) : undefined,
+			snippet: description && description.length > 0 ? description : undefined,
+			extraSnippets: extras && extras.length > 0 ? extras : undefined,
+			favicon: favicon && favicon.length > 0 ? favicon : undefined,
+			domain: hostname && hostname.length > 0 ? hostname : undefined,
+		};
+	});
 }
 
 // ─── Render entry points ────────────────────────────────────────────────
@@ -612,14 +653,46 @@ export function renderSearchResult(
 		sections.push(theme.fg("text", q));
 	}
 
+	// LLM Answer + Follow-ups (sits between Query and Sources).
+	if (isLlm) {
+		const llmResp = response as LlmContextResponse | undefined;
+		const answer = llmResp?.answer !== undefined ? stripControls(llmResp.answer).trim() : "";
+		if (answer.length > 0) {
+			sections.push(theme.fg("toolTitle", "Answer"));
+			for (const wrapped of wrapLine(answer, innerWidth)) {
+				sections.push(theme.fg("text", wrapped));
+			}
+		}
+		const followUps = Array.isArray(llmResp?.follow_up_questions)
+			? llmResp!.follow_up_questions.filter((q): q is string => typeof q === "string").map((q) => stripControls(q).trim()).filter((q) => q.length > 0)
+			: [];
+		if (followUps.length > 0) {
+			sections.push(theme.fg("toolTitle", "Follow-ups"));
+			for (const q of followUps) {
+				for (const wrapped of wrapLine(`• ${q}`, innerWidth)) {
+					sections.push(theme.fg("dim", wrapped));
+				}
+			}
+		}
+	}
+
 	sections.push(theme.fg("toolTitle", "Sources"));
 	for (const line of renderTreeList(
 		sources,
 		{ expanded: opts.expanded, maxCollapsed: MAX_COLLAPSED_ITEMS, itemType: "source", width: opts.width },
 		theme,
-)) {
-	sections.push(line);
-}
+	)) {
+		sections.push(line);
+	}
+
+	// Web total results overflow indicator.
+	if (!isLlm) {
+		const webResp = response as WebSearchResponse | undefined;
+		const total = typeof webResp?.web?.total?.results === "number" ? webResp.web.total.results : undefined;
+		if (typeof total === "number" && total > sources.length) {
+			sections.push(theme.fg("muted", `…and ${total - sources.length} more results`));
+		}
+	}
 
 	// Metadata block: provider label + source URL list (counts as provenance).
 	sections.push(theme.fg("toolTitle", "Metadata"));

@@ -487,3 +487,243 @@ describe("coerceParams", () => {
     expect(result.freshness).toBeUndefined();
   });
 });
+
+// ─── New feature tests: LLM Answer / Follow-ups / Web snippets / totals ────
+
+describe("extractLlmSources — snippet + answer surfaces", () => {
+  test("first snippet from grounding.generic is exposed as `snippet`", () => {
+    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
+    const x = sources.find((s) => s.url === "https://x.example/path");
+    expect(x?.snippet).toBe("first snippet text");
+    const y = sources.find((s) => s.url === "https://y.example");
+    expect(y?.snippet).toBe("third snippet");
+  });
+
+  test("poi snippet is captured", () => {
+    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
+    const poi = sources.find((s) => s.url === "https://poi.example");
+    expect(poi?.snippet).toBe("historic landmark in Berlin");
+  });
+
+  test("missing snippets leave `snippet` undefined", () => {
+    const sources = extractLlmSources({ grounding: { generic: [{ title: "Z", url: "https://z.example" }] } });
+    expect(sources[0]?.snippet).toBeUndefined();
+  });
+
+  test("controls are stripped from snippet text", () => {
+    const sources = extractLlmSources({
+      grounding: { generic: [{ title: "T", url: "https://t.example", snippets: ["a\x01b\x02c"] }] },
+    });
+    expect(sources[0]?.snippet).toBe("abc");
+  });
+});
+
+describe("extractWebSources — description, extra_snippets, meta_url", () => {
+  test("description is mapped to `snippet`", () => {
+    const sources = extractWebSources(SAMPLE_WEB_SEARCH);
+    expect(sources[0]?.snippet).toBe("first description");
+    expect(sources[1]?.snippet).toBe("second description");
+  });
+
+  test("missing description leaves `snippet` undefined", () => {
+    const sources = extractWebSources({ web: { results: [{ title: "X", url: "https://x.example" }] } });
+    expect(sources[0]?.snippet).toBeUndefined();
+  });
+
+  test("extra_snippets are exposed as `extraSnippets` with controls stripped", () => {
+    const sources = extractWebSources({
+      web: {
+        results: [
+          { title: "R", url: "https://r.example", description: "d", extra_snippets: ["a\x01b", "c"] },
+        ],
+      },
+    });
+    expect(sources[0]?.extraSnippets).toEqual(["ab", "c"]);
+  });
+
+  test("meta_url.hostname populates `domain`, meta_url.favicon populates `favicon`", () => {
+    const sources = extractWebSources({
+      web: {
+        results: [
+          {
+            title: "R",
+            url: "https://r.example/path",
+            description: "d",
+            meta_url: { hostname: "r.example", favicon: "https://r.example/favicon.ico" },
+          },
+        ],
+      },
+    });
+    expect(sources[0]?.domain).toBe("r.example");
+    expect(sources[0]?.favicon).toBe("https://r.example/favicon.ico");
+  });
+});
+
+describe("renderResult — LLM Answer section", () => {
+  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
+
+  const LLM_WITH_ANSWER = {
+    answer: "The capital of France is Paris.",
+    follow_up_questions: ["What is the population of Paris?", "When did Paris become the capital?"],
+    grounding: {
+      generic: [{ title: "Wiki", url: "https://w.example", snippets: ["France info"] }],
+    },
+    sources: { "https://w.example": { hostname: "w.example" } },
+  };
+
+  test("renders 'Answer' section header when answer is present", () => {
+    const result = makeResult("", { mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "capital of france" }));
+    expect(out).toContain("Answer");
+    expect(out).toContain("The capital of France is Paris.");
+  });
+
+  test("renders 'Follow-ups' section with bullet lines when follow_up_questions present", () => {
+    const result = makeResult("", { mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).toContain("Follow-ups");
+    expect(out).toContain("What is the population of Paris?");
+    expect(out).toContain("When did Paris become the capital?");
+    expect(out).toContain("•");
+  });
+
+  test("Answer section appears between Query and Sources", () => {
+    const result = makeResult("", { mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    const idxQuery = out.indexOf("Query");
+    const idxAnswer = out.indexOf("Answer");
+    const idxSources = out.indexOf("Sources");
+    expect(idxQuery).toBeGreaterThan(-1);
+    expect(idxAnswer).toBeGreaterThan(idxQuery);
+    expect(idxSources).toBeGreaterThan(idxAnswer);
+  });
+
+  test("empty answer string renders cleanly (regression — no Answer section)", () => {
+    const result = makeResult("", {
+      mode: "llm",
+      response: { answer: "", grounding: { generic: [{ title: "T", url: "https://t.example" }] } },
+    });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).not.toContain("Answer");
+    expect(out).toContain("Sources");
+    expect(out).toMatch(/╭─/);
+  });
+
+  test("whitespace-only answer is treated as empty (no Answer section)", () => {
+    const result = makeResult("", {
+      mode: "llm",
+      response: { answer: "   \n\t  ", grounding: { generic: [{ title: "T", url: "https://t.example" }] } },
+    });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).not.toContain("Answer");
+  });
+});
+
+describe("renderResult — Web snippets and total count", () => {
+  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
+  const expandedOpts: ToolRenderResultOptions = { expanded: true, isPartial: false };
+
+  test("web description renders as snippet under title", () => {
+    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).toContain("first description");
+    expect(out).toContain("second description");
+    expect(out).toContain("third description");
+  });
+
+  test("extra_snippets hidden collapsed when sources > 3", () => {
+    const manyExtras = {
+      web: {
+        results: Array.from({ length: 8 }, (_, i) => ({
+          title: `R${i}`,
+          url: `https://r${i}.example`,
+          description: `desc ${i}`,
+          extra_snippets: [`extra-${i}-A`, `extra-${i}-B`],
+        })),
+      },
+    };
+    const result = makeResult("", { mode: "web", response: manyExtras });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).not.toContain("extra-0-A");
+    expect(out).not.toContain("extra-1-A");
+  });
+
+  test("extra_snippets shown expanded even when many sources", () => {
+    const manyExtras = {
+      web: {
+        results: Array.from({ length: 8 }, (_, i) => ({
+          title: `R${i}`,
+          url: `https://r${i}.example`,
+          description: `desc ${i}`,
+          extra_snippets: [`extra-${i}-A`, `extra-${i}-B`],
+        })),
+      },
+    };
+    const result = makeResult("", { mode: "web", response: manyExtras });
+    const out = flatten(renderResult(result, expandedOpts, stubTheme, { query: "x" }));
+    expect(out).toContain("extra-0-A");
+    expect(out).toContain("extra-7-B");
+  });
+
+  test("extra_snippets shown collapsed when total sources <= 3", () => {
+    const few = {
+      web: {
+        results: [
+          { title: "R1", url: "https://r1.example", description: "d1", extra_snippets: ["extra-1"] },
+          { title: "R2", url: "https://r2.example", description: "d2" },
+        ],
+      },
+    };
+    const result = makeResult("", { mode: "web", response: few });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).toContain("extra-1");
+  });
+
+  test("renders '…and N more results' when total > rendered count", () => {
+    const overflow = {
+      web: {
+        results: Array.from({ length: 5 }, (_, i) => ({
+          title: `R${i}`,
+          url: `https://r${i}.example`,
+          description: `d${i}`,
+        })),
+        total: { results: 42 },
+      },
+    };
+    const result = makeResult("", { mode: "web", response: overflow });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).toContain("…and 37 more results");
+  });
+
+  test("omits total line when total equals rendered count", () => {
+    const exact = {
+      web: {
+        results: Array.from({ length: 3 }, (_, i) => ({
+          title: `R${i}`,
+          url: `https://r${i}.example`,
+          description: `d${i}`,
+        })),
+        total: { results: 3 },
+      },
+    };
+    const result = makeResult("", { mode: "web", response: exact });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).not.toContain("more results");
+  });
+
+  test("missing description renders cleanly (regression — no blank snippet line)", () => {
+    const noDesc = {
+      web: {
+        results: [
+          { title: "R1", url: "https://r1.example" },
+          { title: "R2", url: "https://r2.example" },
+        ],
+      },
+    };
+    const result = makeResult("", { mode: "web", response: noDesc });
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
+    expect(out).toContain("Sources");
+    expect(out).toMatch(/╭─/);
+    expect(out).not.toContain("more results");
+  });
+});
