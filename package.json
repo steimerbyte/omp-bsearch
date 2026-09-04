@@ -1,6 +1,6 @@
 {
   "name": "@steimerbyte/omp-bsearch",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Brave Search API for OMP with ASCII table output, defensive parameter coercion, and LLM-mode locking.",
   "keywords": ["omp-package", "omp", "extension", "brave-search", "web-search"],
   "license": "MIT",
