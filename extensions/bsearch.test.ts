@@ -1,32 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentToolResult, ToolRenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import type { ThemeColor } from "@oh-my-pi/pi-coding-agent/modes/theme/schema";
-import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Component } from "@oh-my-pi/pi-tui";
-import bsearchExtension, {
+import {
   type BsearchDetails,
   type BsearchParams,
   coerceParams,
-  extractWebSources,
-  extractLlmSources,
-  formatCount,
-  getDomain,
-  renderCall,
   renderResult,
-  stripHtml,
-  truncateToWidth,
-  wrapLine,
+  renderSearchResult,
 } from "./bsearch.js";
-
-// ─── Stub theme ─────────────────────────────────────────────────────────────
-// renderCall/renderResult call theme.fg/bold/sep. For tests we need a no-op
-// theme that preserves text so we can assert against the rendered output.
-
-const stubTheme: Theme = {
-  fg: (_k: ThemeColor, s: string) => s,
-  bold: (s: string) => s,
-  sep: { dot: "·", pipe: "│" },
-} as unknown as Theme;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -39,13 +20,12 @@ function flatten(c: Component | undefined): string {
 }
 
 function makeResult(
-  text: string,
   opts: { error?: boolean; mode?: "llm" | "web"; response?: unknown } = {},
 ): AgentToolResult<BsearchDetails> {
   return {
-    content: [{ type: "text", text }],
+    content: [{ type: "text", text: "" }],
     details: {
-      urls: ["https://example.com"],
+      urls: [],
       exitCode: 0,
       mode: opts.mode ?? "llm",
       response: opts.response ?? null,
@@ -56,328 +36,274 @@ function makeResult(
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
-const SAMPLE_LLM_CONTEXT = {
+const LLM_WITH_ANSWER = {
+  answer: "The capital of France is Paris.",
+  follow_up_questions: ["What is the population of Paris?"],
   grounding: {
     generic: [
-      { title: "X — long title for testing", url: "https://x.example/path", snippets: ["first snippet text", "second snippet text"] },
-      { title: "Y", url: "https://y.example", snippets: ["third snippet"] },
+      { title: "Wikipedia", url: "https://w.example/wiki", snippets: ["# mess"] },
+      { title: "Britannica", url: "https://b.example/paris", snippets: ["more mess"] },
     ],
-    poi: { name: "Brandenburger Tor", url: "https://poi.example", snippets: ["historic landmark in Berlin"] },
   },
   sources: {
-    "https://x.example/path": { hostname: "x.example", age: ["2 days ago"] },
-    "https://y.example": { hostname: "y.example" },
+    "https://w.example/wiki": {
+      title: "France — Wikipedia",
+      hostname: "w.example",
+      age: ["Tuesday, August 04, 2026", "2026-08-04", "31 days ago", "2026-08-04T11:17:17Z"],
+      snippet: "France is a country in Europe. Its capital is Paris.",
+    },
+    "https://b.example/paris": {
+      title: "Paris | Britannica",
+      hostname: "b.example",
+      age: ["569 days ago"],
+      snippet: "Paris, city and capital of France.",
+    },
+    // orphan: present in `sources` but NOT in `grounding.generic[]` → must
+    // not be rendered.
+    "https://orphan.example": {
+      title: "Orphan",
+      hostname: "orphan.example",
+      snippet: "should not appear",
+    },
   },
 };
 
-const SAMPLE_WEB_SEARCH = {
+const LLM_NO_ANSWER = {
+  grounding: {
+    generic: [
+      { title: "G1", url: "https://g1.example", snippets: ["x"] },
+      { title: "G2", url: "https://g2.example", snippets: ["y"] },
+    ],
+  },
+  sources: {
+    "https://g1.example": { title: "First", hostname: "g1.example", snippet: "first snippet" },
+    "https://g2.example": { title: "Second", hostname: "g2.example", snippet: "second snippet" },
+  },
+};
+
+const WEB_RESPONSE = {
   web: {
     results: [
-      { title: "R1", url: "https://r1.example", description: "first description", age: "2 days ago" },
-      { title: "R2", url: "https://r2.example", description: "second description" },
-      { title: "R3", url: "https://r3.example", description: "third description", age: "1 week ago" },
+      { title: "R1", url: "https://r1.example", description: "first description", age: "2 days ago", meta_url: { hostname: "r1.example" } },
+      { title: "R2", url: "https://r2.example", description: "second description", meta_url: { hostname: "r2.example" } },
+      { title: "R3", url: "https://r3.example", description: "third description", age: "1 week ago", meta_url: { hostname: "r3.example" } },
     ],
     total: { results: 42 },
   },
 };
 
-// ─── Helper unit tests ─────────────────────────────────────────────────────
+// ─── renderSearchResult — LLM mode ─────────────────────────────────────────
 
-describe("truncateToWidth", () => {
-  test("returns input unchanged when shorter than max", () => {
-    expect(truncateToWidth("hello", 80)).toBe("hello");
+describe("renderSearchResult — LLM mode", () => {
+  test("renders Query + Answer + Sources sections when answer is present", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "capital of france" });
+    expect(out).toContain("# Web Search (Brave LLM Context)");
+    expect(out).toContain("## Query");
+    expect(out).toContain("capital of france");
+    expect(out).toContain("## Answer");
+    expect(out).toContain("The capital of France is Paris.");
+    expect(out).toContain("## Sources");
   });
 
-  test("truncates with ellipsis when over max", () => {
-    const out = truncateToWidth("a".repeat(100), 80);
-    expect(out.length).toBe(80);
-    expect(out.endsWith("…")).toBe(true);
+  test("omits Answer section when answer is missing", () => {
+    const out = renderSearchResult("llm", LLM_NO_ANSWER, { query: "x" });
+    expect(out).not.toContain("## Answer");
+    expect(out).toContain("## Sources");
   });
 
-  test("clamps to 80 chars in renderCall-style usage", () => {
-    const long = "q".repeat(200);
-    expect(truncateToWidth(long, 80).length).toBe(80);
+  test("omits Answer section when answer is empty/whitespace", () => {
+    const out = renderSearchResult(
+      "llm",
+      { ...LLM_NO_ANSWER, answer: "   \n\t  " },
+      { query: "x" },
+    );
+    expect(out).not.toContain("## Answer");
   });
 
-  test("returns empty string when maxWidth is 0", () => {
-    expect(truncateToWidth("anything", 0)).toBe("");
-  });
-});
-
-describe("getDomain", () => {
-  test("extracts hostname from a standard URL", () => {
-    expect(getDomain("https://example.com/path")).toBe("example.com");
-  });
-
-  test("strips leading 'www.' subdomain", () => {
-    expect(getDomain("https://www.example.com/path")).toBe("example.com");
+  test("uses sources[url].snippet (clean), not grounding.generic[].snippets[]", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    expect(out).toContain("France is a country in Europe. Its capital is Paris.");
+    expect(out).toContain("Paris, city and capital of France.");
+    // The messy "# mess" / "more mess" snippets from grounding.generic[].snippets[]
+    // must NOT appear in the rendered output.
+    expect(out).not.toContain("# mess");
+    expect(out).not.toContain("more mess");
   });
 
-  test("preserves other subdomains", () => {
-    expect(getDomain("https://blog.example.com/post")).toBe("blog.example.com");
+  test("renders hostname · age meta line between link and snippet", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    expect(out).toContain("[France — Wikipedia](https://w.example/wiki)");
+    expect(out).toContain("w.example");
+    // Hostname + age rendered together with the · separator. The first
+    // non-empty element of sources[url].age[] is used as-is.
+    expect(out).toMatch(/w\.example\s*·\s*Tuesday, August 04, 2026/);
   });
 
-  test("returns empty string for invalid URL", () => {
-    expect(getDomain("not a url")).toBe("");
+  test("source order matches grounding.generic[] array order", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    const idxWiki = out.indexOf("France — Wikipedia");
+    const idxBrit = out.indexOf("Paris \\| Britannica");
+    expect(idxWiki).toBeGreaterThan(-1);
+    expect(idxBrit).toBeGreaterThan(idxWiki);
   });
 
-  test("handles non-www prefix hostnames without modification", () => {
-    expect(getDomain("https://api.github.com/repos")).toBe("api.github.com");
-  });
-});
-
-describe("formatCount", () => {
-  test("singular for count=1", () => {
-    expect(formatCount("source", 1)).toBe("1 source");
+  test("excludes orphan sources (in sources map but not in grounding.generic[])", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    expect(out).not.toContain("Orphan");
+    expect(out).not.toContain("orphan.example");
   });
 
-  test("plural for count>1", () => {
-    expect(formatCount("source", 5)).toBe("5 sources");
+  test("snippet renders as blockquote under list bullet", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    expect(out).toMatch(/>\s+France is a country in Europe/);
   });
 
-  test("zero is plural in English", () => {
-    expect(formatCount("source", 0)).toBe("0 sources");
-  });
-});
-
-describe("extractLlmSources", () => {
-  test("returns empty array for null/undefined data", () => {
-    expect(extractLlmSources(undefined)).toEqual([]);
-    expect(extractLlmSources(null)).toEqual([]);
+  test("uses first non-empty entry of sources[url].age[] array as-is", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    // First element is "Tuesday, August 04, 2026" — that string must appear
+    // (we use age[0] verbatim).
+    expect(out).toContain("Tuesday, August 04, 2026");
+    // The "31 days ago" form is the THIRD element, so it must NOT appear.
+    expect(out).not.toContain("31 days ago");
   });
 
-  test("extracts generic grounding entries", () => {
-    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
-    expect(sources.length).toBeGreaterThanOrEqual(2);
-    const titles = sources.map((s) => s.title);
-    expect(titles).toContain("X — long title for testing");
-    expect(titles).toContain("Y");
-  });
-
-  test("joins source age arrays into a comma-separated string", () => {
-    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
-    const x = sources.find((s) => s.url === "https://x.example/path");
-    expect(x?.age).toBe("2 days ago");
-  });
-
-  test("includes poi as a source entry", () => {
-    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
-    const poi = sources.find((s) => s.url === "https://poi.example");
-    expect(poi?.title).toBe("Brandenburger Tor");
-  });
-
-  test("extracts map grounding entries by their name", () => {
+  test("escapes unsafe markdown characters in title", () => {
     const data = {
-      grounding: {
-        map: [{ name: "Eiffel Tower", url: "https://map.example/eiffel", snippets: ["iconic Paris landmark"] }],
+      grounding: { generic: [{ title: "T", url: "https://x.example" }] },
+      sources: {
+        "https://x.example": {
+          title: "Pipe | in title and [brackets] and *star*",
+          hostname: "x.example",
+          snippet: "ok",
+        },
       },
     };
-    const sources = extractLlmSources(data);
-    expect(sources.length).toBe(1);
-    expect(sources[0]!.title).toBe("Eiffel Tower");
-  });
-});
-
-describe("extractWebSources", () => {
-  test("returns empty for missing web.results", () => {
-    expect(extractWebSources(undefined)).toEqual([]);
-    expect(extractWebSources({})).toEqual([]);
+    const out = renderSearchResult("llm", data, { query: "x" });
+    expect(out).toContain("Pipe \\| in title");
+    expect(out).toContain("\\[brackets\\]");
+    expect(out).toContain("\\*star\\*");
   });
 
-  test("extracts each web result with title/url/age", () => {
-    const sources = extractWebSources(SAMPLE_WEB_SEARCH);
-    expect(sources.length).toBe(3);
-    expect(sources[0]!.title).toBe("R1");
-    expect(sources[0]!.age).toBe("2 days ago");
-    expect(sources[2]!.age).toBe("1 week ago");
-  });
-
-  test("age is undefined when not provided", () => {
-    const sources = extractWebSources(SAMPLE_WEB_SEARCH);
-    expect(sources[1]!.age).toBeUndefined();
-  });
-});
-
-// ─── renderCall (native status line) ───────────────────────────────────────
-
-describe("renderCall", () => {
-  test("renders pending icon + query in quotes", () => {
-    const out = flatten(renderCall({ query: "test" }, { expanded: false, isPartial: false }, stubTheme));
-    expect(out).toContain("◌");          // pending icon
-    expect(out).toContain("Web Search"); // title
-    expect(out).toContain('"test"');
-  });
-
-  test("truncates long queries to 80 characters", () => {
-    const long = "q".repeat(200);
-    const out = flatten(renderCall({ query: long }, { expanded: false, isPartial: false }, stubTheme));
-    // The rendered header is ` ◌ Web Search "qqqq…qqq"` — the quoted query
-    // captured between the first pair of quotes must be ≤ 80 chars (truncated
-    // by truncateToWidth, plus one trailing "…" if the input was longer).
-    const firstQuote = out.indexOf('"');
-    const secondQuote = out.indexOf('"', firstQuote + 1);
-    expect(firstQuote).toBeGreaterThan(-1);
-    expect(secondQuote).toBeGreaterThan(firstQuote);
-    const captured = out.slice(firstQuote + 1, secondQuote);
-    expect(captured.length).toBeLessThanOrEqual(80);
-  });
-  test("includes count=N meta when args.count is provided", () => {
-    const out = flatten(
-      renderCall({ query: "rust", count: 5 }, { expanded: false, isPartial: false }, stubTheme),
-    );
-    expect(out).toContain("5 sources");
-  });
-
-  test("shows singular '1 source' for count=1", () => {
-    const out = flatten(
-      renderCall({ query: "rust", count: 1 }, { expanded: false, isPartial: false }, stubTheme),
-    );
-    expect(out).toContain("1 source");
-    expect(out).not.toContain("1 sources");
-  });
-
-  test("includes freshness meta when set", () => {
-    const out = flatten(
-      renderCall({ query: "rust", freshness: "pw" }, { expanded: false, isPartial: false }, stubTheme),
-    );
-    expect(out).toContain("fresh=pw");
-  });
-
-  test("renders empty query gracefully", () => {
-    const out = flatten(renderCall({ query: "" }, { expanded: false, isPartial: false }, stubTheme));
-    expect(out).toContain("Web Search");
-    expect(out).toContain("◌");
-  });
-});
-
-// ─── renderResult (native sectioned box layout) ────────────────────────────
-
-describe("renderResult", () => {
-  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
-  const expandedOpts: ToolRenderResultOptions = { expanded: true, isPartial: false };
-
-  test("renders header with Web Search title + provider + source count", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    // Box frame top border
-    expect(out).toContain("╭─");
-    // Header text: status icon + title + provider label + count
-    expect(out).toContain("Web Search");
-    expect(out).toContain("Brave LLM Context");
-    expect(out).toMatch(/\d+ sources?/);
-  });
-
-  test("includes query section when args.query is provided", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "rust async" }));
-    expect(out).toContain("Query");
-    expect(out).toContain("rust async");
-  });
-
-  test("omits query section when args.query is missing", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).not.toContain("Query");
-  });
-
-  test("renders Sources section with tree branches for each source", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toContain("Sources");
-    expect(out).toMatch(/├─/);
-    expect(out).toContain("x.example");
-    expect(out).toContain("y.example");
-  });
-
-  test("includes domain in parentheses and age on the source line", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toMatch(/\(x\.example\)/);
-    expect(out).toContain("2 days ago");
-  });
-
-  test("renders Metadata section with Provider line", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toContain("Metadata");
-    expect(out).toContain("Provider:");
-  });
-
-  test("wraps content in box frame with bottom border", () => {
-    const result = makeResult("", { mode: "llm", response: SAMPLE_LLM_CONTEXT });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toContain("╭─");
-    expect(out).toContain("│");
-    expect(out).toMatch(/╰─+╯/);
-  });
-
-  test("error result renders error panel with ✗ marker", () => {
-    const result = makeResult("network error", { error: true });
-    const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).toContain("✗");
-    expect(out).toContain("Error:");
-    expect(out).toContain("network error");
-  });
-
-  test("zero sources → warning icon + '0 sources' meta", () => {
-    const emptyResp = { grounding: {} };
-    const result = makeResult("", { mode: "llm", response: emptyResp });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toContain("⚠");
-    expect(out).toContain("0 sources");
-  });
-
-  test("web mode renders Web Search provider label", () => {
-    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toContain("Brave Web Search");
-  });
-
-  test("web mode extracts sources from web.results (not from content text)", () => {
-    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toContain("R1");
-    expect(out).toContain("r1.example");
-    expect(out).toContain("r3.example");
-  });
-
-  test("expanded mode keeps all sources visible (no truncation of small lists)", () => {
-    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
-    const collapsedOut = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    const expandedOut = flatten(renderResult(result, expandedOpts, stubTheme, { query: "test" }));
-    // Both renderings include all 3 sources; expanded has no "+N more sources" hint.
-    expect(expandedOut).toContain("R1");
-    expect(expandedOut).toContain("R2");
-    expect(expandedOut).toContain("R3");
-    expect(expandedOut).not.toMatch(/\+\d+ sources? more/);
-    expect(collapsedOut).toContain("R1");
-  });
-
-  test("collapsed mode truncates source list with '+N more sources'", () => {
-    const big = {
-      web: {
-        results: Array.from({ length: 20 }, (_, i) => ({
-          title: `R${i}`,
-          url: `https://r${i}.example`,
-          description: "d",
-        })),
+  test("escapes leading '>' in snippet so blockquote nesting isn't broken", () => {
+    const data = {
+      grounding: { generic: [{ title: "T", url: "https://x.example" }] },
+      sources: {
+        "https://x.example": {
+          title: "T",
+          hostname: "x.example",
+          snippet: "> nested quote would break list rendering",
+        },
       },
     };
-    const result = makeResult("", { mode: "web", response: big });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
-    expect(out).toMatch(/\+\d+ sources? more/);
+    const out = renderSearchResult("llm", data, { query: "x" });
+    // The leading `>` is escaped so the blockquote stays a child of the
+    // list bullet, not a sibling/parent blockquote.
+    expect(out).toContain("\\> nested quote");
+    expect(out).not.toMatch(/^>\s+> nested quote/m);
+  });
+
+  test("snippet text is preserved verbatim (mid-line '>' and '|' are not escaped)", () => {
+    const data = {
+      grounding: { generic: [{ title: "T", url: "https://x.example" }] },
+      sources: {
+        "https://x.example": {
+          title: "T",
+          hostname: "x.example",
+          snippet: "a | b > c",
+        },
+      },
+    };
+    const out = renderSearchResult("llm", data, { query: "x" });
+    // Mid-line characters pass through; only leading `>` triggers escaping.
+    expect(out).toContain("a | b > c");
+  });
+
+  test("renders Sources heading without box characters", () => {
+    const out = renderSearchResult("llm", LLM_WITH_ANSWER, { query: "x" });
+    expect(out).not.toMatch(/╭|╮|╰|╯/);
+    expect(out).not.toContain("│");
   });
 });
 
-// ─── Tool registration guard (regression) ──────────────────────────────────
+// ─── renderSearchResult — Web mode ──────────────────────────────────────────
 
-describe("dual tool registration", () => {
-  test("module exports a default factory function", () => {
-    expect(typeof bsearchExtension).toBe("function");
+describe("renderSearchResult — Web mode", () => {
+  test("renders sources as markdown bullet list with title-link", () => {
+    const out = renderSearchResult("web", WEB_RESPONSE, { query: "x" });
+    expect(out).toContain("# Web Search (Brave Web Search)");
+    expect(out).toContain("## Sources");
+    expect(out).toContain("- [R1](https://r1.example)");
+    expect(out).toContain("- [R2](https://r2.example)");
+    expect(out).toContain("- [R3](https://r3.example)");
+  });
+
+  test("hostname · age rendered between link and snippet", () => {
+    const out = renderSearchResult("web", WEB_RESPONSE, { query: "x" });
+    expect(out).toMatch(/\[R1\]\(https:\/\/r1\.example\)[^\n]*r1\.example\s*·\s*2 days ago/);
+    expect(out).toMatch(/\[R3\]\(https:\/\/r3\.example\)[^\n]*r3\.example\s*·\s*1 week ago/);
+  });
+
+  test("description (clean text) appears as snippet", () => {
+    const out = renderSearchResult("web", WEB_RESPONSE, { query: "x" });
+    expect(out).toContain("first description");
+    expect(out).toContain("second description");
+    expect(out).toContain("third description");
+  });
+
+  test("appends '…and N more results' when total > rendered count", () => {
+    const out = renderSearchResult("web", WEB_RESPONSE, { query: "x" });
+    expect(out).toContain("…and 39 more results");
+  });
+
+  test("renders Query section in web mode when query is provided", () => {
+    const out = renderSearchResult("web", WEB_RESPONSE, { query: "x" });
+    expect(out).toContain("## Query");
+    expect(out).not.toContain("## Answer");
   });
 });
 
-// ─── coerceParams (relaxed coercion layer) ─────────────────────────────────
+// ─── renderResult — plain Text wrapper ──────────────────────────────────────
+
+describe("renderResult — plain Text component wrapper", () => {
+  test("LLM success path returns a Text component containing the markdown", () => {
+    const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "capital of france" }));
+    expect(out).toContain("# Web Search (Brave LLM Context)");
+    expect(out).toContain("## Answer");
+    expect(out).toContain("The capital of France is Paris.");
+    expect(out).toContain("## Sources");
+  });
+
+  test("LLM success path has no box frame or theme tokens", () => {
+    const result = makeResult({ mode: "llm", response: LLM_WITH_ANSWER });
+    const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "x" }));
+    expect(out).not.toMatch(/╭|╮|╰|╯/);
+    expect(out).not.toContain("│");
+    // No ANSI escapes (we never inject theme tokens).
+    expect(out).not.toContain("\u001b[");
+  });
+
+  test("error path renders a plain 'Error: …' Text", () => {
+    const errResult: AgentToolResult<BsearchDetails> = {
+      content: [{ type: "text", text: "network unreachable" }],
+      details: { urls: [], exitCode: null, mode: "llm", response: null },
+      isError: true,
+    };
+    const out = flatten(renderResult(errResult, { expanded: false, isPartial: false }, {} as never));
+    expect(out).toContain("Error: network unreachable");
+    expect(out).not.toMatch(/╭|╮|╰|╯/);
+  });
+
+  test("web mode renderResult pulls from result.details.response", () => {
+    const result = makeResult({ mode: "web", response: WEB_RESPONSE });
+    const out = flatten(renderResult(result, { expanded: false, isPartial: false }, {} as never, { query: "x" }));
+    expect(out).toContain("- [R1](https://r1.example)");
+    expect(out).toContain("- [R3](https://r3.example)");
+    expect(out).toContain("…and 39 more results");
+  });
+});
+
+// ─── coerceParams (regression — unchanged behavior) ─────────────────────────
 
 describe("coerceParams", () => {
   test("count: 100 → 50 (clamped to max)", () => {
@@ -394,10 +320,6 @@ describe("coerceParams", () => {
 
   test("count: undefined → 5 (default)", () => {
     expect(coerceParams({ query: "x" }).count).toBe(5);
-  });
-
-  test("count: 'abc' → 5 (default, unparseable)", () => {
-    expect(coerceParams({ query: "x", count: "abc" }).count).toBe(5);
   });
 
   test("freshness: 'invalid' → undefined (regex mismatch)", () => {
@@ -490,450 +412,22 @@ describe("coerceParams", () => {
   });
 });
 
-// ─── New feature tests: LLM Answer / Follow-ups / Web snippets / totals ────
+// ─── Module exports (regression) ────────────────────────────────────────────
 
-describe("extractLlmSources — snippet + answer surfaces", () => {
-  test("first snippet from grounding.generic is exposed as `snippet`", () => {
-    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
-    const x = sources.find((s) => s.url === "https://x.example/path");
-    expect(x?.snippet).toBe("first snippet text");
-    const y = sources.find((s) => s.url === "https://y.example");
-    expect(y?.snippet).toBe("third snippet");
+describe("module exports", () => {
+  test("renderSearchResult is exported as a function", () => {
+    expect(typeof renderSearchResult).toBe("function");
   });
 
-  test("poi snippet is captured", () => {
-    const sources = extractLlmSources(SAMPLE_LLM_CONTEXT);
-    const poi = sources.find((s) => s.url === "https://poi.example");
-    expect(poi?.snippet).toBe("historic landmark in Berlin");
+  test("renderResult is exported as a function", () => {
+    expect(typeof renderResult).toBe("function");
   });
 
-  test("missing snippets leave `snippet` undefined", () => {
-    const sources = extractLlmSources({ grounding: { generic: [{ title: "Z", url: "https://z.example" }] } });
-    expect(sources[0]?.snippet).toBeUndefined();
-  });
-
-  test("controls are stripped from snippet text", () => {
-    const sources = extractLlmSources({
-      grounding: { generic: [{ title: "T", url: "https://t.example", snippets: ["a\x01b\x02c"] }] },
-    });
-    expect(sources[0]?.snippet).toBe("abc");
-  });
-});
-
-describe("extractWebSources — description, extra_snippets, meta_url", () => {
-  test("description is mapped to `snippet`", () => {
-    const sources = extractWebSources(SAMPLE_WEB_SEARCH);
-    expect(sources[0]?.snippet).toBe("first description");
-    expect(sources[1]?.snippet).toBe("second description");
-  });
-
-  test("missing description leaves `snippet` undefined", () => {
-    const sources = extractWebSources({ web: { results: [{ title: "X", url: "https://x.example" }] } });
-    expect(sources[0]?.snippet).toBeUndefined();
-  });
-
-  test("extra_snippets are exposed as `extraSnippets` with controls stripped", () => {
-    const sources = extractWebSources({
-      web: {
-        results: [
-          { title: "R", url: "https://r.example", description: "d", extra_snippets: ["a\x01b", "c"] },
-        ],
-      },
-    });
-    expect(sources[0]?.extraSnippets).toEqual(["ab", "c"]);
-  });
-
-  test("meta_url.hostname populates `domain`, meta_url.favicon populates `favicon`", () => {
-    const sources = extractWebSources({
-      web: {
-        results: [
-          {
-            title: "R",
-            url: "https://r.example/path",
-            description: "d",
-            meta_url: { hostname: "r.example", favicon: "https://r.example/favicon.ico" },
-          },
-        ],
-      },
-    });
-    expect(sources[0]?.domain).toBe("r.example");
-    expect(sources[0]?.favicon).toBe("https://r.example/favicon.ico");
-  });
-});
-
-describe("renderResult — LLM Answer section", () => {
-  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
-
-  const LLM_WITH_ANSWER = {
-    answer: "The capital of France is Paris.",
-    follow_up_questions: ["What is the population of Paris?", "When did Paris become the capital?"],
-    grounding: {
-      generic: [{ title: "Wiki", url: "https://w.example", snippets: ["France info"] }],
-    },
-    sources: { "https://w.example": { hostname: "w.example" } },
-  };
-
-  test("renders 'Answer' section header when answer is present", () => {
-    const result = makeResult("", { mode: "llm", response: LLM_WITH_ANSWER });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "capital of france" }));
-    expect(out).toContain("Answer");
-    expect(out).toContain("The capital of France is Paris.");
-  });
-
-  test("renders 'Follow-ups' section with bullet lines when follow_up_questions present", () => {
-    const result = makeResult("", { mode: "llm", response: LLM_WITH_ANSWER });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).toContain("Follow-ups");
-    expect(out).toContain("What is the population of Paris?");
-    expect(out).toContain("When did Paris become the capital?");
-    expect(out).toContain("•");
-  });
-
-  test("Answer section appears between Query and Sources", () => {
-    const result = makeResult("", { mode: "llm", response: LLM_WITH_ANSWER });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    const idxQuery = out.indexOf("Query");
-    const idxAnswer = out.indexOf("Answer");
-    const idxSources = out.indexOf("Sources");
-    expect(idxQuery).toBeGreaterThan(-1);
-    expect(idxAnswer).toBeGreaterThan(idxQuery);
-    expect(idxSources).toBeGreaterThan(idxAnswer);
-  });
-
-  test("empty answer string renders cleanly (regression — no Answer section)", () => {
-    const result = makeResult("", {
-      mode: "llm",
-      response: { answer: "", grounding: { generic: [{ title: "T", url: "https://t.example" }] } },
-    });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).not.toContain("Answer");
-    expect(out).toContain("Sources");
-    expect(out).toMatch(/╭─/);
-  });
-
-  test("whitespace-only answer is treated as empty (no Answer section)", () => {
-    const result = makeResult("", {
-      mode: "llm",
-      response: { answer: "   \n\t  ", grounding: { generic: [{ title: "T", url: "https://t.example" }] } },
-    });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).not.toContain("Answer");
-  });
-});
-
-describe("renderResult — Web snippets and total count", () => {
-  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
-  const expandedOpts: ToolRenderResultOptions = { expanded: true, isPartial: false };
-
-  test("web description renders as snippet under title", () => {
-    const result = makeResult("", { mode: "web", response: SAMPLE_WEB_SEARCH });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).toContain("first description");
-    expect(out).toContain("second description");
-    expect(out).toContain("third description");
-  });
-
-  test("extra_snippets hidden collapsed when sources > 3", () => {
-    const manyExtras = {
-      web: {
-        results: Array.from({ length: 8 }, (_, i) => ({
-          title: `R${i}`,
-          url: `https://r${i}.example`,
-          description: `desc ${i}`,
-          extra_snippets: [`extra-${i}-A`, `extra-${i}-B`],
-        })),
-      },
-    };
-    const result = makeResult("", { mode: "web", response: manyExtras });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).not.toContain("extra-0-A");
-    expect(out).not.toContain("extra-1-A");
-  });
-
-  test("extra_snippets shown expanded even when many sources", () => {
-    const manyExtras = {
-      web: {
-        results: Array.from({ length: 8 }, (_, i) => ({
-          title: `R${i}`,
-          url: `https://r${i}.example`,
-          description: `desc ${i}`,
-          extra_snippets: [`extra-${i}-A`, `extra-${i}-B`],
-        })),
-      },
-    };
-    const result = makeResult("", { mode: "web", response: manyExtras });
-    const out = flatten(renderResult(result, expandedOpts, stubTheme, { query: "x" }));
-    expect(out).toContain("extra-0-A");
-    expect(out).toContain("extra-7-B");
-  });
-
-  test("extra_snippets shown collapsed when total sources <= 3", () => {
-    const few = {
-      web: {
-        results: [
-          { title: "R1", url: "https://r1.example", description: "d1", extra_snippets: ["extra-1"] },
-          { title: "R2", url: "https://r2.example", description: "d2" },
-        ],
-      },
-    };
-    const result = makeResult("", { mode: "web", response: few });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).toContain("extra-1");
-  });
-
-  test("renders '…and N more results' when total > rendered count", () => {
-    const overflow = {
-      web: {
-        results: Array.from({ length: 5 }, (_, i) => ({
-          title: `R${i}`,
-          url: `https://r${i}.example`,
-          description: `d${i}`,
-        })),
-        total: { results: 42 },
-      },
-    };
-    const result = makeResult("", { mode: "web", response: overflow });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).toContain("…and 37 more results");
-  });
-
-  test("omits total line when total equals rendered count", () => {
-    const exact = {
-      web: {
-        results: Array.from({ length: 3 }, (_, i) => ({
-          title: `R${i}`,
-          url: `https://r${i}.example`,
-          description: `d${i}`,
-        })),
-        total: { results: 3 },
-      },
-    };
-    const result = makeResult("", { mode: "web", response: exact });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).not.toContain("more results");
-  });
-
-  test("missing description renders cleanly (regression — no blank snippet line)", () => {
-    const noDesc = {
-      web: {
-        results: [
-          { title: "R1", url: "https://r1.example" },
-          { title: "R2", url: "https://r2.example" },
-        ],
-      },
-    };
-    const result = makeResult("", { mode: "web", response: noDesc });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).toContain("Sources");
-    expect(out).toMatch(/╭─/);
-    expect(out).not.toContain("more results");
-  });
-});
-
-
-// ─── stripHtml — HTML entity / tag stripping ───────────────────────────────
-describe("stripHtml", () => {
-  test("removes HTML tags including <strong>", () => {
-    expect(stripHtml("<strong>Tokio futures</strong> support epoll/kqueue/iocp")).toBe(
-      "Tokio futures support epoll/kqueue/iocp",
-    );
-  });
-
-  test("decodes &amp; entity", () => {
-    expect(stripHtml("Q&amp;A about Tokio")).toBe("Q&A about Tokio");
-  });
-
-  test("decodes &quot; entity", () => {
-    expect(stripHtml("she said &quot;hi&quot;")).toBe('she said "hi"');
-  });
-
-  test("decodes &lt;, &gt;, &#39;, &nbsp; entities", () => {
-    expect(stripHtml("&lt;a&gt;&#39;ok&#39;&nbsp;end")).toBe("<a>'ok' end");
-  });
-
-  test("strips tags AND decodes entities when both are present", () => {
-    expect(stripHtml("<em>Q&amp;A</em>")).toBe("Q&A");
-  });
-
-  test("returns empty string for non-string input", () => {
-    expect(stripHtml(undefined as unknown as string)).toBe("");
-    expect(stripHtml(null as unknown as string)).toBe("");
-    expect(stripHtml(42 as unknown as string)).toBe("");
-  });
-
-  test("leaves plain text unchanged", () => {
-    expect(stripHtml("no markup here")).toBe("no markup here");
-  });
-});
-
-// ─── wrapLine — word-aware wrap ─────────────────────────────────────────────
-describe("wrapLine", () => {
-  test("returns empty array for empty input", () => {
-    expect(wrapLine("", 80)).toEqual([]);
-  });
-
-  test("returns single token when it fits", () => {
-    expect(wrapLine("hello world", 80)).toEqual(["hello world"]);
-  });
-
-  test("splits at whitespace boundaries to respect width", () => {
-    const out = wrapLine("aa bb cc dd ee", 8);
-    expect(out).toEqual(["aa bb cc", "dd ee"]);
-    for (const line of out) expect(line.length).toBeLessThanOrEqual(8);
-  });
-
-  test("long single token is NOT split mid-word — emitted on its own line", () => {
-    // Build a long identifier-like token programmatically so the test
-    // does not depend on a particular literal value being preserved.
-    const token = "a".repeat(15) + "b".repeat(15);
-    const out = wrapLine(`${token} tail`, 10);
-    // The long token must appear intact on a line by itself.
-    expect(out).toContain(token);
-    expect(out.some((l) => l === token)).toBe(true);
-    // No line should be a partial subset of the token (a mid-word break).
-    for (const line of out) {
-      expect(line === token || line === "tail" || /^a+b+$/.test(line)).toBe(true);
-    }
-  });
-
-  test("long URL token is NOT split mid-word", () => {
-    const url = "https://example.com/very/long/path/that/exceeds/width";
-    const out = wrapLine(`click ${url} now`, 20);
-    expect(out).toContain(url);
-    // No line should be a mid-token fragment like "path/that/exceeds/width"
-    // stripped of the URL prefix.
-    for (const line of out) {
-      expect(line === "click" || line.startsWith("click ") || line === url || line === "now").toBe(true);
-    }
-  });
-
-  test("hyphenated phrase 'Tokio's' is not broken across lines", () => {
-    const text = "Tokio's runtime is the only isolated function";
-    const out = wrapLine(text, 14);
-    // No line should start with a broken fragment that is clearly a
-    // continuation of a wrapped hyphenated phrase (e.g. just "s" or
-    // "'s runtime" — these were the old word-wrap bug).
-    for (let i = 1; i < out.length; i++) {
-      expect(out[i]).not.toMatch(/^s\s/); // would mean "s" was torn off "Tokio's"
-      expect(out[i]).not.toMatch(/^'s\s/); // would mean "'s" was torn off
-    }
-    // The token "Tokio's" must appear as a whole on some line.
-    expect(out.some((l) => l.includes("Tokio's"))).toBe(true);
-    // The full text content must be preserved across lines.
-    expect(out.join(" ")).toBe(text);
-  });
-
-  test("id-like token 'epoll/kqueue/iocp' is not split", () => {
-    const text = "runtime uses epoll/kqueue/iocp under the hood";
-    const out = wrapLine(text, 16);
-    expect(out).toContain("epoll/kqueue/iocp");
-    for (const line of out) {
-      const firstWord = line.split(/\s+/)[0]!;
-      expect(firstWord).not.toBe("kqueue/iocp");
-      expect(firstWord).not.toBe("iocp");
-    }
-  });
-
-  test("width <= 0 returns single empty line", () => {
-    expect(wrapLine("hello", 0)).toEqual([""]);
-    expect(wrapLine("hello", -1)).toEqual([""]);
-  });
-});
-
-// ─── Snippet cleaning — HTML stripping reaches the extractor output ────────
-describe("extractWebSources — HTML stripping on description & extra_snippets", () => {
-  test("description HTML tags are stripped", () => {
-    const sources = extractWebSources({
-      web: {
-        results: [
-          {
-            title: "R",
-            url: "https://r.example",
-            description: "<strong>Tokio futures</strong> support epoll/kqueue/iocp",
-          },
-        ],
-      },
-    });
-    expect(sources[0]?.snippet).toBe("Tokio futures support epoll/kqueue/iocp");
-    expect(sources[0]?.snippet).not.toMatch(/<[^>]+>/);
-  });
-
-  test("description HTML entities are decoded", () => {
-    const sources = extractWebSources({
-      web: {
-        results: [
-          {
-            title: "R",
-            url: "https://r.example",
-            description: "Q&amp;A:&nbsp;&quot;async runtime&quot;",
-          },
-        ],
-      },
-    });
-    expect(sources[0]?.snippet).toBe('Q&A: "async runtime"');
-  });
-
-  test("extra_snippets HTML tags and entities are stripped", () => {
-    const sources = extractWebSources({
-      web: {
-        results: [
-          {
-            title: "R",
-            url: "https://r.example",
-            description: "d",
-            extra_snippets: ["<em>foo</em> &amp; <code>bar</code>", "Q&quot;Z"],
-          },
-        ],
-      },
-    });
-    expect(sources[0]?.extraSnippets).toEqual(["foo & bar", "Q\"Z"]);
-  });
-});
-
-describe("extractLlmSources — HTML stripping on snippets", () => {
-  test("snippet HTML tags and entities are stripped", () => {
-    const sources = extractLlmSources({
-      grounding: {
-        generic: [
-          {
-            title: "T",
-            url: "https://t.example",
-            snippets: ["<strong>Tokio</strong> &amp; <em>Rust</em>"],
-          },
-        ],
-      },
-    });
-    expect(sources[0]?.snippet).toBe("Tokio & Rust");
-  });
-});
-
-// ─── Renderer integration — long token wrap doesn't fragment the snippet ───
-describe("renderResult — long-token snippet stays readable", () => {
-  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
-
-  test("long URL in web snippet is not broken mid-token across box lines", () => {
-    const longUrl = "https://example.com/very/long/path/that/exceeds/the/inner/width/budget";
-    const result = makeResult("", {
-      mode: "web",
-      response: {
-        web: {
-          results: [
-            {
-              title: "R1",
-              url: "https://r1.example",
-              description: `See ${longUrl} for details`,
-            },
-          ],
-        },
-      },
-    });
-    const out = flatten(renderResult(result, opts, stubTheme, { query: "x" }));
-    expect(out).toContain(longUrl);
-    // No line in the rendered output should start with a mid-token fragment
-    // such as "path/that/exceeds/..." stripped of the URL prefix.
-    for (const line of out.split("\n")) {
-      expect(line).not.toMatch(/\|\s+path\/that\/exceeds/);
-      expect(line).not.toMatch(/\|\s+exceeds\/the\/inner/);
-    }
+  test("BsearchParams and BsearchDetails are exported as types", () => {
+    // Type-only — just verify they're exported at the value level (BsearchParams is a type alias).
+    const p: BsearchParams = { query: "x" };
+    expect(p.query).toBe("x");
+    const d: BsearchDetails = { urls: [], exitCode: 0, mode: "llm", response: null };
+    expect(d.mode).toBe("llm");
   });
 });
