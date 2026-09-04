@@ -63,8 +63,116 @@ export type BsearchParams = {
   local?: boolean;
   compact?: boolean;
   timeout?: number;
-  mode?: string;
 };
+// ─── Relaxed parameter coercion ────────────────────────────────────────────
+// The TypeBox schema stays strict (validates user/LLM-supplied JSON), but
+// execute() runs every incoming payload through coerceParams() so that any
+// malformed value is replaced with a sane fallback / clamped into the
+// Brave-documented range BEFORE we hand it to the API. Goal: the search
+// always executes, even when the model passes a wildly wrong value.
+
+function coerceNumber(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return fallback;
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed)) {
+      if (parsed < min) return min;
+      if (parsed > max) return max;
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function coerceString(value: unknown, maxLen: number): string {
+  if (value === undefined || value === null) return "";
+  const s = typeof value === "string" ? value : String(value);
+  const trimmed = s.trim();
+  if (trimmed.length > maxLen) return trimmed.slice(0, maxLen);
+  return trimmed;
+}
+
+function coerceEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  if (typeof value !== "string") return fallback;
+  const lower = value.toLowerCase();
+  return (allowed as readonly string[]).includes(lower) ? (lower as T) : fallback;
+}
+
+
+
+const VALID_FRESHNESS = /^(pd|pw|pm|py|\d{4}-\d{2}-\d{2}to\d{4}-\d{2}-\d{2})$/;
+
+export function coerceParams(raw: unknown): BsearchParams {
+  const r = (raw ?? {}) as Record<string, unknown>;
+
+  const query = coerceString(r.query, 500);
+
+  const count = coerceNumber(r.count, DEFAULT_RESULT_COUNT, 1, 50);
+  let offset: number | undefined;
+  if (r.offset !== undefined) {
+    const n = typeof r.offset === "number" && Number.isFinite(r.offset)
+      ? r.offset
+      : Number(String(r.offset).trim());
+    if (Number.isFinite(n) && n >= 0) {
+      offset = n > 1000 ? 1000 : n;
+    }
+  }
+
+  let freshness: string | undefined;
+  if (typeof r.freshness === "string" && VALID_FRESHNESS.test(r.freshness)) {
+    freshness = r.freshness;
+  }
+
+  const safesearch = coerceEnum(
+    r.safesearch,
+    ["off", "moderate", "strict"] as const,
+    "off",
+  );
+
+  const maxTokens = coerceNumber(r.max_tokens, 8192, 1024, 32768);
+  const maxUrls = coerceNumber(r.max_urls, DEFAULT_RESULT_COUNT, 1, 50);
+
+  const threshold = coerceEnum(
+    r.threshold,
+    ["strict", "balanced", "lenient", "disabled"] as const,
+    "balanced",
+  );
+
+  let country: string | undefined;
+  if (typeof r.country === "string" && r.country.length === 2) {
+    country = r.country.toLowerCase();
+  }
+
+  let city: string | undefined;
+  if (typeof r.city === "string" && r.city.length > 0) {
+    city = r.city;
+  }
+
+  const local = Boolean(r.local);
+  const compact = Boolean(r.compact);
+  const timeout = coerceNumber(r.timeout, DEFAULT_TOOL_TIMEOUT_MS, 1000, 120000);
+  return {
+    query,
+    count,
+    freshness,
+    offset,
+    safesearch,
+    max_tokens: maxTokens,
+    max_urls: maxUrls,
+    threshold,
+    country,
+    city,
+    local,
+    compact,
+    timeout,
+  };
+}
 
 export interface BsearchDetails {
   urls: string[];
@@ -72,19 +180,6 @@ export interface BsearchDetails {
   mode: "llm" | "web";
 }
 
-export interface ParsedSource {
-  index: number;
-  title: string;
-  url: string;
-  snippets: string[];
-  age?: string;
-}
-
-export interface ParsedOutput {
-  totalSources: number;
-  sources: ParsedSource[];
-  rawText: string;
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -218,166 +313,154 @@ async function performWebSearch(params: BsearchParams, apiKey: string): Promise<
   return (await response.json()) as WebSearchResponse;
 }
 
-function truncate(str: string | undefined, maxLen: number): string {
-  if (!str) return "";
-  if (str.length <= maxLen) return str;
-  return str.slice(0, Math.max(0, maxLen - 3)) + "...";
+// ─── Table rendering ──────────────────────────────────────────────────────
+// `mode` is passed by the caller: "llm" for LLM Context responses,
+// "web" for Web Search responses. The function inspects the top-level shape
+// of `data` and renders Markdown-style ASCII tables so terminal output stays
+// readable. No raw JSON is returned.
+
+type RenderMode = "llm" | "web";
+
+const FIELD_MAX = 80;       // clamp Title/URL/Snippets/Description/Name to this
+const COL_MAX = 200;        // hard ceiling on a computed column width
+const SNIPPET_SEP = " | ";  // separator between joined snippets
+
+function clamp(s: string, max: number): string {
+  if (s.length <= max) return s;
+  if (max <= 1) return s.slice(0, max);
+  return s.slice(0, max - 1) + "…";
 }
 
-function formatLlmContext(data: LlmContextResponse, compact = false): string[] {
-  const lines: string[] = [];
-  const grounding = data.grounding ?? {};
-  const sources = data.sources ?? {};
-  let totalSnippets = 0;
-
-  if (grounding.poi) {
-    const poi = grounding.poi;
-    totalSnippets += poi.snippets?.length ?? 0;
-    lines.push(`📍 ${poi.name}`);
-    lines.push(`   ${poi.url}`);
-    for (const s of (poi.snippets ?? []).slice(0, compact ? 1 : 3)) {
-      lines.push(`   ${truncate(s, 300)}`);
-    }
-    lines.push("");
-  }
-
-  if (grounding.map && grounding.map.length > 0) {
-    lines.push("🗺️  Local Results:");
-    grounding.map.slice(0, compact ? 3 : 5).forEach((m, i) => {
-      totalSnippets += m.snippets?.length ?? 0;
-      lines.push("");
-      lines.push(`${i + 1}. ${m.name}`);
-      lines.push(`   ${m.url}`);
-      for (const s of (m.snippets ?? []).slice(0, compact ? 1 : 2)) {
-        lines.push(`   ${truncate(s, 200)}`);
-      }
-    });
-    lines.push("");
-  }
-
-  if (grounding.generic && grounding.generic.length > 0) {
-    lines.push(`📄 Sources (${grounding.generic.length}):`);
-    lines.push("");
-    grounding.generic.forEach((item, i) => {
-      const snippetCount = item.snippets?.length ?? 0;
-      totalSnippets += snippetCount;
-      const snippetLimit = compact ? 1 : 3;
-      lines.push(`${i + 1}. ${item.title}`);
-      lines.push(`   ${item.url}`);
-      for (const s of (item.snippets ?? []).slice(0, snippetLimit)) {
-        lines.push(`   ${truncate(s, 300)}`);
-      }
-      if ((item.snippets?.length ?? 0) > snippetLimit) {
-        lines.push(`   [+${(item.snippets?.length ?? 0) - snippetLimit} more snippets]`);
-      }
-      lines.push("");
-    });
-  } else {
-    lines.push("⚠️  No relevant content found for this query.");
-    lines.push("");
-  }
-
-  lines.push("─".repeat(60));
-  lines.push(`Total: ${grounding.generic?.length ?? 0} sources, ~${totalSnippets} snippets`);
-
-  if (Object.keys(sources).length > 0) {
-    lines.push("");
-    lines.push("📅 Source ages:");
-    for (const [, meta] of Object.entries(sources)) {
-      const age = meta.age && meta.age.length > 0 ? ` (${meta.age[2] ?? meta.age[0]})` : "";
-      lines.push(`   ${meta.hostname}${age}`);
-    }
-  }
-
-  return lines;
+function pad(s: string, width: number): string {
+  if (s.length >= width) return s;
+  return s + " ".repeat(width - s.length);
 }
 
-function formatWebSearch(data: WebSearchResponse, query: string): string[] {
-  const lines: string[] = [];
-  const results = data.web?.results ?? [];
-
-  if (results.length === 0) {
-    lines.push("No results found");
-    return lines;
-  }
-
-  lines.push(`[Web Search] Found ${results.length} results for "${query}":`);
-  lines.push("");
-  results.forEach((r, i) => {
-    lines.push(`${i + 1}. ${r.title}`);
-    lines.push(`   ${r.url}`);
-    if (r.description) lines.push(`   ${truncate(r.description, 250)}`);
-    if (r.age) lines.push(`   (${r.age})`);
-    lines.push("");
-  });
-
-  if (data.web?.total?.results && data.web.total.results > results.length) {
-    lines.push(`~${data.web.total.results} total.`);
-  }
-
-  return lines;
+function joinSnippets(snippets: string[] | undefined): string {
+  if (!snippets || snippets.length === 0) return "";
+  return snippets.map((s) => clamp(stripControls(s), FIELD_MAX)).join(SNIPPET_SEP);
 }
 
-const SOURCE_HEADER_RE = /^(\d+)\.\s+(.+)$/;
-const URL_LINE_RE = /^(https?:\/\/\S+)\s*$/;
-const SOURCES_HEADER_RE = /^📄\s+Sources\s+\((\d+)\):?\s*$/i;
+interface ColumnSpec {
+  header: string;
+  width: number;
+}
 
-export function parseBsearchOutput(text: string): ParsedOutput {
-  const lines = text.split("\n");
-  const sources: ParsedSource[] = [];
-  let totalSources = 0;
-  let current: ParsedSource | null = null;
-  let snippetBuffer: string[] = [];
-
-  const flush = () => {
-    if (current) {
-      current.snippets = snippetBuffer.map((s) => s.trim()).filter(Boolean);
-      sources.push(current);
-    }
-    current = null;
-    snippetBuffer = [];
-  };
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    const headerMatch = SOURCES_HEADER_RE.exec(trimmed);
-    if (headerMatch) {
-      flush();
-      totalSources = parseInt(headerMatch[1] ?? "0", 10);
-      continue;
-    }
-
-    const numMatch = SOURCE_HEADER_RE.exec(trimmed);
-    if (numMatch) {
-      flush();
-      current = {
-        index: parseInt(numMatch[1] ?? "0", 10),
-        title: (numMatch[2] ?? "").trim(),
-        url: "",
-        snippets: [],
-      };
-      continue;
-    }
-
-    if (current && URL_LINE_RE.test(trimmed)) {
-      current.url = trimmed;
-      continue;
-    }
-
-    if (current && /^\(.+\)$/.test(trimmed)) {
-      current.age = trimmed.slice(1, -1);
-      continue;
-    }
-
-    if (current && trimmed.length > 0) {
-      snippetBuffer.push(trimmed);
+function buildRows(
+  rows: string[][],
+  headers: string[],
+): { spec: ColumnSpec[]; lines: string[] } {
+  // Compute column widths: max(header, max(value)) capped to COL_MAX.
+  const widths = headers.map((h) => h.length);
+  for (const row of rows) {
+    for (let i = 0; i < headers.length; i++) {
+      const v = row[i] ?? "";
+      if (v.length > widths[i]!) widths[i] = v.length;
     }
   }
-  flush();
+  const spec: ColumnSpec[] = headers.map((h, i) => ({
+    header: h,
+    width: Math.min(Math.max(widths[i]!, h.length), COL_MAX),
+  }));
 
-  return { totalSources: totalSources || sources.length, sources, rawText: text };
+  const renderRow = (cells: string[]): string =>
+    "| " + spec.map((c, i) => pad(cells[i] ?? "", c.width)).join(" | ") + " |";
+
+  const sep =
+    "|" + spec.map((c) => "-".repeat(c.width + 2)).join("|") + "|";
+
+  const lines: string[] = [renderRow(spec.map((c) => c.header)), sep];
+  for (const row of rows) lines.push(renderRow(row));
+  return { spec, lines };
 }
+
+function tableBlock(headers: string[], rows: string[][]): string {
+  if (rows.length === 0) return "No results";
+  return buildRows(rows, headers).lines.join("\n");
+}
+
+function renderLlmContextAsTable(data: unknown): string {
+  const d = data as LlmContextResponse;
+  const blocks: string[] = [];
+
+  const generic = d.grounding?.generic;
+  if (generic && generic.length > 0) {
+    const rows = generic.map((g, i) => [
+      String(i + 1),
+      clamp(stripControls(g.title ?? ""), FIELD_MAX),
+      clamp(stripControls(g.url ?? ""), FIELD_MAX),
+      joinSnippets(g.snippets),
+    ]);
+    blocks.push(tableBlock(["#", "Title", "URL", "Snippets"], rows));
+  }
+
+  const map = d.grounding?.map;
+  if (map && map.length > 0) {
+    const rows = map.map((m, i) => [
+      String(i + 1),
+      clamp(stripControls(m.name ?? ""), FIELD_MAX),
+      clamp(stripControls(m.url ?? ""), FIELD_MAX),
+      joinSnippets(m.snippets),
+    ]);
+    if (blocks.length > 0) blocks.push("");
+    blocks.push(tableBlock(["#", "Name", "URL", "Snippets"], rows));
+  }
+
+  const poi = d.grounding?.poi;
+  if (poi) {
+    const row = [
+      "1",
+      clamp(stripControls(poi.name ?? ""), FIELD_MAX),
+      clamp(stripControls(poi.url ?? ""), FIELD_MAX),
+      joinSnippets(poi.snippets),
+    ];
+    if (blocks.length > 0) blocks.push("");
+    blocks.push(tableBlock(["#", "Name", "URL", "Snippets"], [row]));
+  }
+
+  const sources = d.sources;
+  if (sources) {
+    const entries = Object.entries(sources);
+    if (entries.length > 0) {
+      const rows = entries.map(([url, src], i) => [
+        String(i + 1),
+        clamp(stripControls(src.hostname ?? ""), FIELD_MAX),
+        clamp(stripControls(url), FIELD_MAX),
+        clamp(stripControls((src.age ?? []).join(", ")), FIELD_MAX),
+      ]);
+      if (blocks.length > 0) blocks.push("");
+      blocks.push(tableBlock(["#", "Hostname", "URL", "Age"], rows));
+    }
+  }
+
+  return blocks.length > 0 ? blocks.join("\n") : "No results";
+}
+
+function renderWebSearchAsTable(data: unknown): string {
+  const d = data as WebSearchResponse;
+  const results = d.web?.results ?? [];
+  if (results.length === 0) return "No results";
+
+  const rows = results.map((r, i) => [
+    String(i + 1),
+    clamp(stripControls(r.title ?? ""), FIELD_MAX),
+    clamp(stripControls(r.url ?? ""), FIELD_MAX),
+    clamp(stripControls(r.description ?? ""), FIELD_MAX),
+    clamp(stripControls(r.age ?? ""), FIELD_MAX),
+  ]);
+
+  const block = tableBlock(["#", "Title", "URL", "Description", "Age"], rows);
+  const total = d.web?.total?.results;
+  const totalHint =
+    typeof total === "number" ? `\n\nTotal results reported by Brave: ${total}` : "";
+  return block + totalHint;
+}
+
+export function renderApiResponseAsTable(data: unknown, mode: RenderMode): string {
+  if (mode === "web") return renderWebSearchAsTable(data);
+  return renderLlmContextAsTable(data);
+}
+
 
 function textContent(text: string): TextContent {
   return { type: "text", text };
@@ -408,30 +491,20 @@ function extractUrls(text: string): string[] {
   return [...new Set(text.match(URL_REGEX) ?? [])];
 }
 
-async function executeBsearch(params: BsearchParams): Promise<AgentToolResult<BsearchDetails>> {
+async function executeBsearch(rawParams: BsearchParams): Promise<AgentToolResult<BsearchDetails>> {
+  const params = coerceParams(rawParams);
   try {
     const apiKey = await resolveApiKey();
-    const mode = params.mode ?? "llm";
-
-    if (mode === "web") {
-      const data = await performWebSearch(params, apiKey);
-      const lines = formatWebSearch(data, params.query);
-      const text = lines.join("\n");
-      const urls = extractUrls(text);
-      return okResult(text, { urls, exitCode: 0, mode: "web" });
-    }
     try {
       const data = await performLlmContext(params, apiKey);
-      const lines = formatLlmContext(data, params.compact ?? false);
-      const text = lines.join("\n");
+      const text = renderApiResponseAsTable(data, "llm");
       const urls = extractUrls(text);
       return okResult(text, { urls, exitCode: 0, mode: "llm" });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message.includes("OPTION_NOT_IN_PLAN")) {
         const data = await performWebSearch(params, apiKey);
-        const lines = formatWebSearch(data, params.query);
-        const text = lines.join("\n");
+        const text = renderApiResponseAsTable(data, "web");
         const urls = extractUrls(text);
         return okResult(text, { urls, exitCode: 0, mode: "web" });
       }
@@ -450,10 +523,8 @@ export function renderCall(
 ): Component {
   const q = stripControls(args.query ?? "");
   const meta: string[] = [];
-  if (args.mode && args.mode !== "llm") meta.push(`mode=${args.mode}`);
   if (args.count !== undefined) meta.push(`count=${args.count}`);
   if (args.freshness) meta.push(`fresh=${args.freshness}`);
-  if (args.country) meta.push(`cc=${args.country.toUpperCase()}`);
   if (args.city) meta.push(`city=${args.city}`);
   if (args.local) meta.push("local");
   const metaSuffix = meta.length > 0 ? " " + theme.fg("muted", meta.join(" ")) : "";
@@ -476,12 +547,11 @@ export function renderResult(
 
   const textBlock = result.content.find((c) => c.type === "text");
   const text = (textBlock && "text" in textBlock ? textBlock.text : "") ?? "";
-  const parsed = parseBsearchOutput(text);
   const urls = result.details?.urls ?? [];
   const mode = result.details?.mode ?? "llm";
 
   const queryLabel = args?.query ? `"${args.query}"` : "web search";
-  const headerLine = `Brave Search (${mode}) — ${queryLabel} — ${urls.length} URLs · ${parsed.totalSources} sources`;
+  const headerLine = `Brave Search (${mode}) — ${queryLabel} — ${urls.length} URLs`;
 
   const allLines = text.split("\n");
   let bodyLines = allLines;
@@ -511,7 +581,6 @@ export default function bsearchExtension(pi: ExtensionAPI): void {
     local: Type.Optional(Type.Boolean({ description: "Force local recall for location-aware queries" })),
     compact: Type.Optional(Type.Boolean({ description: "Compact output (fewer snippets)" })),
     timeout: Type.Optional(Type.Number({ description: "Request timeout in ms", minimum: 1000 })),
-    mode: Type.Optional(Type.String({ description: "Mode: llm or web" })),
   });
 
   pi.registerTool({

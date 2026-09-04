@@ -1,7 +1,7 @@
 {
   "name": "@steimerbyte/omp-bsearch",
-  "version": "0.1.0",
-  "description": "Brave Search API as OMP v18 extension tool. Wraps bsearch CLI with ~/.omp/agent/settings.json API key handling.",
+  "version": "2.0.0",
+  "description": "Brave Search API for OMP with ASCII table output, defensive parameter coercion, and LLM-mode locking.",
   "keywords": ["omp-package", "omp", "extension", "brave-search", "web-search"],
   "license": "MIT",
   "type": "module",

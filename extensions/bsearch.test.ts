@@ -6,7 +6,8 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import bsearchExtension, {
   type BsearchDetails,
   type BsearchParams,
-  parseBsearchOutput,
+  coerceParams,
+  renderApiResponseAsTable,
   renderCall,
   renderResult,
 } from "./bsearch.js";
@@ -41,151 +42,135 @@ function makeResult(text: string, opts?: { error?: boolean }): AgentToolResult<B
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
-const SAMPLE_OUTPUT = `📄 Sources (3):
 
-1. First Source Title
-   https://first.example.com
-   First source snippet line one.
-   First source snippet line two.
 
-2. Second Source Title
-   https://second.example.com
-   (1 day ago)
-   Second source snippet.
+// ─── renderApiResponseAsTable (ASCII table) ────────────────────────────────
 
-3. Third Source Title
-   https://third.example.com
-   Third snippet A.
-   Third snippet B.
-   Third snippet C.
-`;
+const SAMPLE_LLM_CONTEXT = {
+  grounding: {
+    generic: [
+      { title: "X — long title for testing", url: "https://x.example/path", snippets: ["first snippet text", "second snippet text"] },
+      { title: "Y", url: "https://y.example", snippets: ["third snippet"] },
+    ],
+    poi: { name: "Brandenburger Tor", url: "https://poi.example", snippets: ["historic landmark in Berlin"] },
+  },
+  sources: {
+    "https://x.example/path": { hostname: "x.example", age: ["2 days ago"] },
+    "https://y.example": { hostname: "y.example" },
+  },
+};
 
-const EMPTY_OUTPUT = `📄 Sources (0):
+const SAMPLE_WEB_SEARCH = {
+  web: {
+    results: [
+      { title: "R1", url: "https://r1.example", description: "first description", age: "2 days ago" },
+      { title: "R2", url: "https://r2.example", description: "second description" },
+      { title: "R3", url: "https://r3.example", description: "third description", age: "1 week ago" },
+    ],
+    total: { results: 42 },
+  },
+};
 
-`;
+describe("renderApiResponseAsTable", () => {
+  test("LLM mode: renders grounding.generic as ASCII table with #/Title/URL/Snippets columns", () => {
+    const text = renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm");
+    expect(text).toMatch(/\|\s*#\s*\|\s*Title\s*\|\s*URL\s*\|\s*Snippets\s*\|/);
+    expect(text).toContain("https://x.example/path");
+    expect(text).toContain("https://y.example");
+    expect(text).toContain("first snippet text | second snippet text");
+    expect(text).toContain("third snippet");
+    // Two data rows from the fixture (1 and 2 in the first data table).
+    expect(text).toMatch(/^\|\s*1\s*\|/m);
+    expect(text).toMatch(/^\|\s*2\s*\|/m);
+  });
+
+  test("LLM mode: renders grounding.poi as a 1-row mini table", () => {
+    const text = renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm");
+    expect(text).toContain("Brandenburger Tor");
+    expect(text).toContain("historic landmark in Berlin");
+    // poi table has exactly one data row numbered "1" after a Name header.
+    const poiBlock = text.split("Name")[1] ?? "";
+    expect(poiBlock).toMatch(/^\|\s*1\s*\|/m);
+  });
+
+  test("LLM mode: renders sources block as #/Hostname/URL/Age table", () => {
+    const text = renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm");
+    expect(text).toMatch(/\|\s*#\s*\|\s*Hostname\s*\|\s*URL\s*\|\s*Age\s*\|/);
+    expect(text).toContain("x.example");
+    expect(text).toContain("y.example");
+  });
+
+  test("LLM mode: empty grounding → 'No results'", () => {
+    expect(renderApiResponseAsTable({}, "llm")).toBe("No results");
+    expect(renderApiResponseAsTable({ grounding: {} }, "llm")).toBe("No results");
+  });
+
+  test("Web mode: renders results as #/Title/URL/Description/Age table", () => {
+    const text = renderApiResponseAsTable(SAMPLE_WEB_SEARCH, "web");
+    expect(text).toMatch(/\|\s*#\s*\|\s*Title\s*\|\s*URL\s*\|\s*Description\s*\|\s*Age\s*\|/);
+    expect(text).toContain("https://r1.example");
+    expect(text).toContain("first description");
+    expect(text).toContain("2 days ago");
+    expect(text).toContain("https://r3.example");
+    // Three data rows: numbered 1, 2, 3.
+    expect(text).toMatch(/^\|\s*1\s*\|/m);
+    expect(text).toMatch(/^\|\s*2\s*\|/m);
+    expect(text).toMatch(/^\|\s*3\s*\|/m);
+  });
+
+  test("Web mode: shows total hint from web.total.results", () => {
+    const text = renderApiResponseAsTable(SAMPLE_WEB_SEARCH, "web");
+    expect(text).toContain("Total results reported by Brave: 42");
+  });
+
+  test("Web mode: empty results → 'No results'", () => {
+    expect(renderApiResponseAsTable({}, "web")).toBe("No results");
+    expect(renderApiResponseAsTable({ web: { results: [] } }, "web")).toBe("No results");
+  });
+
+  test("clamps overlong fields to 80 chars (with ellipsis)", () => {
+    const long = "x".repeat(200);
+    const data = {
+      web: { results: [{ title: long, url: "https://long", description: "d" }] },
+    };
+    const text = renderApiResponseAsTable(data, "web");
+    const lines = text.split("\n");
+    const sepIdx = lines.findIndex((l) => l.startsWith("|---"));
+    const dataLine = lines[sepIdx + 1] ?? "";
+    // Title column is bounded; whole data line stays under a reasonable cap.
+    expect(dataLine.length).toBeLessThan(400);
+    expect(dataLine).toContain("…");
+  });
+});
 
 const ERROR_OUTPUT = "bsearch exited with code 1: network error";
-
-// ─── parseBsearchOutput ─────────────────────────────────────────────────────
-
-describe("parseBsearchOutput", () => {
-  test("parses header with explicit totalSources", () => {
-    const result = parseBsearchOutput(SAMPLE_OUTPUT);
-    expect(result.totalSources).toBe(3);
-    expect(result.sources).toHaveLength(3);
-  });
-
-  test("captures index, title, url per source", () => {
-    const result = parseBsearchOutput(SAMPLE_OUTPUT);
-    expect(result.sources[0]).toMatchObject({
-      index: 1,
-      title: "First Source Title",
-      url: "https://first.example.com",
-    });
-    expect(result.sources[1]?.url).toBe("https://second.example.com");
-    expect(result.sources[2]?.url).toBe("https://third.example.com");
-  });
-
-  test("captures all snippet lines per source", () => {
-    const result = parseBsearchOutput(SAMPLE_OUTPUT);
-    expect(result.sources[0]?.snippets).toEqual([
-      "First source snippet line one.",
-      "First source snippet line two.",
-    ]);
-    expect(result.sources[2]?.snippets).toHaveLength(3);
-  });
-
-  test("captures age tag in parentheses", () => {
-    const result = parseBsearchOutput(SAMPLE_OUTPUT);
-    expect(result.sources[1]?.age).toBe("1 day ago");
-  });
-
-  test("returns empty sources for empty output without crashing", () => {
-    const result = parseBsearchOutput(EMPTY_OUTPUT);
-    expect(result.sources).toEqual([]);
-    expect(result.totalSources).toBe(0);
-  });
-
-  test("preserves rawText for raw rendering", () => {
-    const result = parseBsearchOutput(SAMPLE_OUTPUT);
-    expect(result.rawText).toBe(SAMPLE_OUTPUT);
-  });
-
-  test("falls back to sources.length if totalSources missing", () => {
-    const noHeader = `1. Only Source
-   https://only.example.com
-   Some snippet.
-`;
-    const result = parseBsearchOutput(noHeader);
-    expect(result.totalSources).toBe(1);
-    expect(result.sources).toHaveLength(1);
-  });
-});
-
-// ─── renderCall ─────────────────────────────────────────────────────────────
-
-describe("renderCall", () => {
-  const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
-
-  test("includes query in quotes", () => {
-    const args: BsearchParams = { query: "typescript testing" };
-    const out = flatten(renderCall(args, opts, stubTheme));
-    expect(out).toContain('"typescript testing"');
-  });
-
-  test("does NOT contain hardcoded 'brave_search ' prefix (Fix #1)", () => {
-    const args: BsearchParams = { query: "x" };
-    const out = flatten(renderCall(args, opts, stubTheme));
-    expect(out).not.toMatch(/brave_search\s+/);
-    expect(out).toMatch(/Brave Search/);
-  });
-
-  test("shows count when provided", () => {
-    const args: BsearchParams = { query: "x", count: 5 };
-    const out = flatten(renderCall(args, opts, stubTheme));
-    expect(out).toContain("count=5");
-  });
-
-  test("hides mode=llm (default)", () => {
-    const args: BsearchParams = { query: "x", mode: "llm" };
-    const out = flatten(renderCall(args, opts, stubTheme));
-    expect(out).not.toContain("mode=");
-  });
-
-  test("shows mode=web when explicit", () => {
-    const args: BsearchParams = { query: "x", mode: "web" };
-    const out = flatten(renderCall(args, opts, stubTheme));
-    expect(out).toContain("mode=web");
-  });
-
-  test("strips ESC and NUL control bytes from query", () => {
-    const args: BsearchParams = { query: "safe\x00\x1bDANGEROUS" };
-    const out = flatten(renderCall(args, opts, stubTheme));
-    expect(out).toContain("safeDANGEROUS");
-    expect(out).not.toContain("\x00");
-    expect(out).not.toContain("\x1b");
-  });
-});
-
-// ─── renderResult ───────────────────────────────────────────────────────────
-
 describe("renderResult", () => {
   const opts: ToolRenderResultOptions = { expanded: false, isPartial: false };
   const expandedOpts: ToolRenderResultOptions = { expanded: true, isPartial: false };
 
-  test("renders plain-text header with mode + counts", () => {
-    const result = makeResult(SAMPLE_OUTPUT);
-    const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).toContain("Brave Search (llm)");
-    expect(out).toMatch(/\d+ URLs?\s+·\s+3 sources/);
+  test("renders header with mode + URL count (no 'sources' word in header line)", () => {
+    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "test" }));
+    const headerLine = out.split("\n")[0] ?? "";
+    expect(headerLine).toContain("Brave Search (llm)");
+    expect(headerLine).toContain('"test"');
+    expect(headerLine).toMatch(/\d+ URLs?$/);
+    expect(headerLine).not.toContain("sources");
   });
 
-  test("renders source content line by line (plain text append)", () => {
-    const result = makeResult(SAMPLE_OUTPUT);
+  test("includes the query in quotes in the rendered header", () => {
+    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
+    const out = flatten(renderResult(result, opts, stubTheme, { query: "rust async" }));
+    expect(out).toContain('"rust async"');
+  });
+
+  test("renders table body line by line (no raw JSON, contains URL column)", () => {
+    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
     const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).toContain("First Source Title");
-    expect(out).toContain("https://first.example.com");
-    expect(out).toContain("First source snippet line one.");
+    expect(out).toContain("https://x.example/path");
+    expect(out).toContain("https://y.example");
+    expect(out).not.toContain('"generic"');
+    expect(out).not.toContain('"snippets": [');
   });
 
   test("error result renders error marker", () => {
@@ -194,19 +179,29 @@ describe("renderResult", () => {
     expect(out).toContain("✗");
   });
 
-  test("expanded mode preserves all source content", () => {
-    const result = makeResult(SAMPLE_OUTPUT);
+  test("expanded mode preserves all table content", () => {
+    const result = makeResult(renderApiResponseAsTable(SAMPLE_LLM_CONTEXT, "llm"));
     const out = flatten(renderResult(result, expandedOpts, stubTheme));
-    expect(out).toContain("First Source Title");
-    expect(out).toContain("Third snippet C.");
+    expect(out).toContain("https://x.example/path");
+    expect(out).toContain("https://y.example");
   });
-
-  test("collapsed mode truncates very long output", () => {
-    const longText = Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n");
+  test("collapsed mode truncates very long table output", () => {
+    // Build a fixture large enough to exceed COLLAPSED_MAX_LINES (80) of lines.
+    const big = {
+      web: {
+        results: Array.from({ length: 200 }, (_, i) => ({
+          title: `R${i}`,
+          url: `https://r${i}.example`,
+          description: "x".repeat(200),
+          age: "1 day ago",
+        })),
+      },
+    };
+    const longText = renderApiResponseAsTable(big, "web");
     const result = makeResult(longText);
     const out = flatten(renderResult(result, opts, stubTheme));
-    expect(out).toContain("line 1");
-    expect(out).toContain("[+120 more lines]");
+    expect(out).toContain("R0");
+    expect(out).toMatch(/\[\+\d+ more lines\]/);
   });
 });
 
@@ -215,5 +210,118 @@ describe("renderResult", () => {
 describe("dual tool registration", () => {
   test("module exports a default factory function", () => {
     expect(typeof bsearchExtension).toBe("function");
+  });
+});
+
+// ─── coerceParams (relaxed coercion layer) ─────────────────────────────────
+
+describe("coerceParams", () => {
+  test("count: 100 → 50 (clamped to max)", () => {
+    expect(coerceParams({ query: "x", count: 100 }).count).toBe(50);
+  });
+
+  test("count: 0 → 1 (clamped to min)", () => {
+    expect(coerceParams({ query: "x", count: 0 }).count).toBe(1);
+  });
+
+  test("count: '5' → 5 (string-to-number coercion)", () => {
+    expect(coerceParams({ query: "x", count: "5" }).count).toBe(5);
+  });
+
+  test("count: undefined → 5 (default)", () => {
+    expect(coerceParams({ query: "x" }).count).toBe(5);
+  });
+
+  test("count: 'abc' → 5 (default, unparseable)", () => {
+    expect(coerceParams({ query: "x", count: "abc" }).count).toBe(5);
+  });
+
+  test("freshness: 'invalid' → undefined (regex mismatch)", () => {
+    expect(coerceParams({ query: "x", freshness: "invalid" }).freshness).toBeUndefined();
+  });
+
+  test("freshness: 'pd' → 'pd' (valid)", () => {
+    expect(coerceParams({ query: "x", freshness: "pd" }).freshness).toBe("pd");
+  });
+
+  test("safesearch: 'extreme' → 'off' (not in enum)", () => {
+    expect(coerceParams({ query: "x", safesearch: "extreme" }).safesearch).toBe("off");
+  });
+
+  test("country: 'USA' → undefined (length != 2)", () => {
+    expect(coerceParams({ query: "x", country: "USA" }).country).toBeUndefined();
+  });
+
+  test("country: 'US' → 'us' (lowercased)", () => {
+    expect(coerceParams({ query: "x", country: "US" }).country).toBe("us");
+  });
+
+  test("query: 123 → '123' (number coerced to string)", () => {
+    expect(coerceParams({ query: 123 }).query).toBe("123");
+  });
+
+  test("query: '' → '' (empty string preserved)", () => {
+    expect(coerceParams({ query: "" }).query).toBe("");
+  });
+
+  test("query: undefined → '' (fallback)", () => {
+    expect(coerceParams({}).query).toBe("");
+  });
+
+  test("max_tokens: 999 → 1024 (clamped to min)", () => {
+    expect(coerceParams({ query: "x", max_tokens: 999 }).max_tokens).toBe(1024);
+  });
+
+  test("max_tokens: 99999 → 32768 (clamped to max)", () => {
+    expect(coerceParams({ query: "x", max_tokens: 99999 }).max_tokens).toBe(32768);
+  });
+
+  test("threshold: 'weird' → 'balanced' (not in enum)", () => {
+    expect(coerceParams({ query: "x", threshold: "weird" }).threshold).toBe("balanced");
+  });
+
+  test("offset: -5 → undefined (negative dropped, default omitted)", () => {
+    expect(coerceParams({ query: "x", offset: -5 }).offset).toBeUndefined();
+  });
+
+  test("timeout: 500 → 1000 (clamped to min)", () => {
+    expect(coerceParams({ query: "x", timeout: 500 }).timeout).toBe(1000);
+  });
+
+  test("timeout: 200000 → 120000 (clamped to max)", () => {
+    expect(coerceParams({ query: "x", timeout: 200000 }).timeout).toBe(120000);
+  });
+
+  test("local: 'yes' → true (truthy string)", () => {
+    expect(coerceParams({ query: "x", local: "yes" }).local).toBe(true);
+  });
+
+  test("local: 0 → false (falsy)", () => {
+    expect(coerceParams({ query: "x", local: 0 }).local).toBe(false);
+  });
+
+  test("safesearch: 'OFF' → 'off' (lowercased enum match)", () => {
+    expect(coerceParams({ query: "x", safesearch: "OFF" }).safesearch).toBe("off");
+  });
+
+  test("city: 'Berlin' → 'Berlin' (preserved)", () => {
+    expect(coerceParams({ query: "x", city: "Berlin" }).city).toBe("Berlin");
+  });
+
+  test("max_urls: 0 → 1 (clamped to min)", () => {
+    expect(coerceParams({ query: "x", max_urls: 0 }).max_urls).toBe(1);
+  });
+
+  test("freshness: '2025-01-01to2025-12-31' → preserved (valid regex)", () => {
+    expect(coerceParams({ query: "x", freshness: "2025-01-01to2025-12-31" }).freshness).toBe(
+      "2025-01-01to2025-12-31",
+    );
+  });
+
+  test("null raw → empty-coerced defaults (no crash)", () => {
+    const result = coerceParams(null);
+    expect(result.query).toBe("");
+    expect(result.count).toBe(5);
+    expect(result.freshness).toBeUndefined();
   });
 });
