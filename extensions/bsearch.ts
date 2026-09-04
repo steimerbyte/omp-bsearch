@@ -466,6 +466,129 @@ export function wrapLine(text: string, width: number): string[] {
 	return lines;
 }
 
+// ─── Markdown stripping (graceful fallback for plain-text rendering) ────────
+// Strips common Markdown syntax so snippets / answers rendered as plain text
+// don't leak raw ##, **, [..](..) markers to the terminal. Lightweight regex-
+// based — no parser dependency.
+const HEADING_RE = /^\s{0,3}#{1,6}\s+(.*)$/;
+const BOLD_RE = /\*\*(.+?)\*\*|__(.+?)__/g;
+const ITALIC_RE = /(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|_(.+?)_/g;
+const CODE_RE = /`([^`]+)`/g;
+const LINK_RE = /\[([^\]]+)\]\([^)]+\)/g;
+const QUOTE_RE = /^\s{0,3}>\s?(.*)$/;
+const BULLET_RE = /^(\s*)[-*+]\s+(.*)$/;
+const ORDERED_LIST_RE = /^(\s*)\d+\.\s+(.*)$/;
+
+export function stripMarkdown(input: string): string {
+	if (typeof input !== "string" || input.length === 0) return "";
+	const out: string[] = [];
+	for (const rawLine of input.split(/\r?\n/)) {
+		const heading = rawLine.match(HEADING_RE);
+		if (heading) {
+			out.push(heading[1]!.trim());
+			continue;
+		}
+		const quote = rawLine.match(QUOTE_RE);
+		if (quote) {
+			out.push(quote[1] ?? "");
+			continue;
+		}
+		const bullet = rawLine.match(BULLET_RE);
+		if (bullet) {
+			const indent = bullet[1] ?? "";
+			out.push(`${indent}• ${bullet[2] ?? ""}`);
+			continue;
+		}
+		const ordered = rawLine.match(ORDERED_LIST_RE);
+		if (ordered) {
+			out.push(rawLine.replace(/^\s*/, ""));
+			continue;
+		}
+		out.push(rawLine);
+	}
+	let result = out.join("\n");
+	result = result.replace(LINK_RE, "$1");
+	result = result.replace(BOLD_RE, (_m, a, b) => (a ?? b ?? ""));
+	result = result.replace(ITALIC_RE, (_m, a, b) => (a ?? b ?? ""));
+	result = result.replace(CODE_RE, (_m, c) => (c ?? ""));
+	return result;
+}
+
+// ─── Multi-line wrap ────────────────────────────────────────────────────────
+// Splits text on newlines and wraps each line independently so multi-paragraph
+// content renders as separate paragraphs inside the box frame. Blank lines
+// are preserved as empty content rows. Bullet lines get a 2-char hanging
+// indent so wrapped continuations align under the bullet glyph.
+export function wrapMultiLine(text: string, width: number): string[] {
+	if (typeof text !== "string" || text.length === 0) return [];
+	if (width <= 0) return text.split(/\r?\n/);
+	const result: string[] = [];
+	for (const rawLine of text.split(/\r?\n/)) {
+		if (rawLine.trim().length === 0) {
+			result.push("");
+			continue;
+		}
+		const bulletMatch = rawLine.match(BULLET_RE);
+		const orderedMatch = rawLine.match(ORDERED_LIST_RE);
+		if (bulletMatch) {
+			const indent = bulletMatch[1] ?? "";
+			const body = bulletMatch[2] ?? "";
+			const hanging = `${indent}• `;
+			const contIndent = " ".repeat(hanging.length);
+			const wrapped = wrapLine(body, width - hanging.length);
+			for (let i = 0; i < wrapped.length; i++) {
+				const line = wrapped[i]!;
+				result.push(i === 0 ? `${hanging}${line}` : `${contIndent}${line}`);
+			}
+			continue;
+		}
+		if (orderedMatch) {
+			const indent = orderedMatch[1] ?? "";
+			const body = orderedMatch[2] ?? "";
+			const prefixMatch = rawLine.match(/^\s*\d+\.\s+/)!;
+			const hanging = `${indent}${prefixMatch[0].slice(indent.length)}`;
+			const contIndent = " ".repeat(hanging.length);
+			const wrapped = wrapLine(body, width - hanging.length);
+			for (let i = 0; i < wrapped.length; i++) {
+				const line = wrapped[i]!;
+				result.push(i === 0 ? `${hanging}${line}` : `${contIndent}${line}`);
+			}
+			continue;
+		}
+		for (const w of wrapLine(rawLine, width)) result.push(w);
+	}
+	return result;
+}
+
+// ─── Age normalization ───────────────────────────────────────────────────────
+// Brave returns age as a comma-joined string with multiple representations:
+//   "Tuesday, August 04, 2026, 2026-08-04, 31 days ago, 2026-08-04T11:17:17Z"
+// We pick the FIRST chunk that contains "ago" (relative form) or matches an
+// ISO date (YYYY-MM-DD) when no relative form is present.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z?$/;
+
+export function normalizeAge(raw: string | string[] | null | undefined): string | undefined {
+	if (raw === undefined || raw === null) return undefined;
+	// Always split into comma-separated chunks. Brave's age is sometimes a
+	// single-element array holding the full string, sometimes an already-split
+	// multi-element array, sometimes a plain string — normalize all forms.
+	const joined = Array.isArray(raw) ? raw.join(",") : raw;
+	const parts = joined
+		.split(",")
+		.map((p) => p.trim())
+		.filter((p) => p.length > 0);
+	if (parts.length === 0) return undefined;
+	const relative = parts.find((p) => /\bago\b/i.test(p));
+	if (relative) return relative;
+	const iso = parts.find((p) => ISO_DATE_RE.test(p));
+	if (iso) return iso;
+	for (const p of parts) {
+		if (!ISO_DATETIME_RE.test(p)) return p;
+	}
+	return undefined;
+}
+
 function renderBoxFrame(
 	content: string[],
 	args: { header: string; width: number; padHeader?: boolean },
@@ -486,7 +609,7 @@ function renderBoxFrame(
 			theme.fg("dim", BOX_HORIZ.repeat(headerFill) + BOX_TR),
 	);
 	for (const line of content) {
-		for (const wrapped of wrapLine(line, innerWidth)) {
+		for (const wrapped of wrapMultiLine(line, innerWidth)) {
 			out.push(
 				theme.fg("dim", BOX_VERT) +
 					" " +
@@ -529,27 +652,29 @@ function renderTreeList(
 		const branch = isLast ? "└─" : "├─";
 		const src = items[i]!;
 		const domain = src.domain ?? getDomain(src.url);
+		// Meta is rendered on its OWN line below the title so a long title no
+		// longer has to share column budget with the meta suffix.
 		const metaParts: string[] = [];
 		if (domain) metaParts.push(theme.fg("dim", `(${domain})`));
 		if (src.age) metaParts.push(theme.fg("muted", src.age));
-		const metaSuffix = metaParts.length > 0
-			? " " + theme.fg("dim", "·") + " " + metaParts.join(" " + theme.fg("dim", "·") + " ")
-			: "";
-		const innerWidth = Math.max(10, args.width - 6); // border + "├─ "
-		const titleBudget = Math.max(8, innerWidth - visibleWidth(metaSuffix));
+		const metaText = metaParts.join(" " + theme.fg("dim", "·") + " ");
+		const titleInnerWidth = Math.max(10, args.width - 6);
 		const titleText = src.title || src.url || "Untitled";
-		const title = theme.fg("accent", truncateToWidth(titleText, titleBudget));
-		lines.push(`  ${theme.fg("dim", branch)} ${title}${metaSuffix}`);
+		const title = theme.fg("accent", truncateToWidth(titleText, titleInnerWidth));
+		lines.push(`  ${theme.fg("dim", branch)} ${title}`);
+		if (metaText.length > 0) {
+			lines.push(`      ${metaText}`);
+		}
 		// Snippet (dim/muted, wrapped, indented to align under title).
 		if (src.snippet) {
-			for (const wrapped of wrapLine(src.snippet, innerWidth)) {
+			for (const wrapped of wrapMultiLine(src.snippet, titleInnerWidth)) {
 				lines.push(`      ${theme.fg("muted", wrapped)}`);
 			}
 		}
 		// Extra snippets only when expanded OR small list.
 		if (showExtras && src.extraSnippets) {
 			for (const extra of src.extraSnippets) {
-				for (const wrapped of wrapLine(extra, innerWidth)) {
+				for (const wrapped of wrapMultiLine(extra, titleInnerWidth)) {
 					lines.push(`      ${theme.fg("dim", wrapped)}`);
 				}
 			}
@@ -568,8 +693,11 @@ function renderTreeList(
 export function extractLlmSources(data: unknown): RenderSource[] {
 	const d = data as LlmContextResponse | undefined;
 	if (!d) return [];
-	const cleanSnippet = (s: string | undefined): string | undefined =>
-		s === undefined ? undefined : stripControls(stripHtml(s));
+	const cleanSnippet = (s: string | undefined): string | undefined => {
+		if (s === undefined) return undefined;
+		const cleaned = stripControls(stripHtml(s));
+		return cleaned.length > 0 ? stripMarkdown(cleaned) : cleaned;
+	};
 	const sources: RenderSource[] = [];
 	for (const g of d.grounding?.generic ?? []) {
 		if (!g) continue;
@@ -577,7 +705,7 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 		sources.push({
 			title: stripControls(g.title ?? ""),
 			url: g.url ?? "",
-			age: d.sources?.[g.url ?? ""]?.age?.join(", "),
+			age: normalizeAge(d.sources?.[g.url ?? ""]?.age),
 			snippet: cleanSnippet(firstSnippet),
 		});
 	}
@@ -587,7 +715,7 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 		sources.push({
 			title: stripControls(m.name ?? m.url ?? "Map result"),
 			url: m.url ?? "",
-			age: d.sources?.[m.url ?? ""]?.age?.join(", "),
+			age: normalizeAge(d.sources?.[m.url ?? ""]?.age),
 			snippet: cleanSnippet(firstSnippet),
 		});
 	}
@@ -597,36 +725,44 @@ export function extractLlmSources(data: unknown): RenderSource[] {
 		sources.push({
 			title: stripControls(p.name ?? "POI"),
 			url: p.url ?? "",
-			age: d.sources?.[p.url ?? ""]?.age?.join(", "),
+			age: normalizeAge(d.sources?.[p.url ?? ""]?.age),
 			snippet: cleanSnippet(firstSnippet),
 		});
 	}
+
 	return sources;
 }
 
 export function extractWebSources(data: unknown): RenderSource[] {
 	const d = data as WebSearchResponse | undefined;
 	if (!d?.web?.results) return [];
-	const cleanSnippet = (s: string | undefined): string | undefined =>
-		s === undefined ? undefined : stripControls(stripHtml(s));
+	const cleanSnippet = (s: string | undefined): string | undefined => {
+		if (s === undefined) return undefined;
+		const cleaned = stripControls(stripHtml(s));
+		return cleaned.length > 0 ? stripMarkdown(cleaned) : cleaned;
+	};
 	const cleanExtras = (xs: unknown): string[] | undefined => {
 		if (!Array.isArray(xs)) return undefined;
 		const out: string[] = [];
 		for (const x of xs) {
-			if (typeof x === "string") out.push(stripControls(stripHtml(x)));
+			if (typeof x === "string") {
+				const cleaned = stripControls(stripHtml(x));
+				out.push(cleaned.length > 0 ? stripMarkdown(cleaned) : cleaned);
+			}
 		}
 		return out.length > 0 ? out : undefined;
 	};
 	return d.web.results.map((r) => {
 		const description = typeof r.description === "string" ? stripControls(stripHtml(r.description)) : undefined;
+		const snippet = description && description.length > 0 ? stripMarkdown(description) : undefined;
 		const extras = cleanExtras(r.extra_snippets);
 		const favicon = typeof r.meta_url?.favicon === "string" ? stripControls(r.meta_url.favicon) : undefined;
 		const hostname = typeof r.meta_url?.hostname === "string" ? r.meta_url.hostname : undefined;
 		return {
 			title: stripControls(r.title ?? ""),
 			url: r.url ?? "",
-			age: r.age ? stripControls(r.age) : undefined,
-			snippet: description && description.length > 0 ? description : undefined,
+			age: normalizeAge(r.age),
+			snippet,
 			extraSnippets: extras && extras.length > 0 ? extras : undefined,
 			favicon: favicon && favicon.length > 0 ? favicon : undefined,
 			domain: hostname && hostname.length > 0 ? hostname : undefined,
@@ -634,15 +770,9 @@ export function extractWebSources(data: unknown): RenderSource[] {
 	});
 }
 
-// ─── Render entry points ────────────────────────────────────────────────
 export interface RenderSearchOptions {
 	expanded: boolean;
 	width: number;
-}
-
-export function renderSearchCall(args: { query?: string }): string {
-	const q = truncateToWidth(stripControls(args.query ?? ""), 80);
-	return ` ${STATUS_ICONS.pending} ${q ? `"${q}"` : ""}`.trimEnd();
 }
 
 export function renderSearchResult(
@@ -655,18 +785,11 @@ export function renderSearchResult(
 	const isLlm = mode === "llm";
 	const sources = isLlm ? extractLlmSources(response) : extractWebSources(response);
 	const success = sources.length > 0;
-
 	const providerLabel = isLlm ? "Brave LLM Context" : "Brave Web Search";
 	const header = renderStatusLine(
-		{
-			icon: success ? "success" : "warning",
-			title: "Web Search",
-			description: providerLabel,
-			meta: [formatCount("source", sources.length)],
-		},
+		{ icon: success ? "success" : "warning", title: "Web Search", description: providerLabel, meta: [formatCount("source", sources.length)] },
 		theme,
 	);
-
 	const innerWidth = Math.max(20, opts.width - 2);
 	const sections: string[] = [];
 
@@ -676,13 +799,13 @@ export function renderSearchResult(
 		sections.push(theme.fg("text", q));
 	}
 
-	// LLM Answer + Follow-ups (sits between Query and Sources).
 	if (isLlm) {
 		const llmResp = response as LlmContextResponse | undefined;
 		const answer = llmResp?.answer !== undefined ? stripControls(llmResp.answer).trim() : "";
 		if (answer.length > 0) {
 			sections.push(theme.fg("toolTitle", "Answer"));
-			for (const wrapped of wrapLine(answer, innerWidth)) {
+			const cleaned = stripMarkdown(answer);
+			for (const wrapped of wrapMultiLine(cleaned, innerWidth)) {
 				sections.push(theme.fg("text", wrapped));
 			}
 		}
@@ -692,7 +815,7 @@ export function renderSearchResult(
 		if (followUps.length > 0) {
 			sections.push(theme.fg("toolTitle", "Follow-ups"));
 			for (const q of followUps) {
-				for (const wrapped of wrapLine(`• ${q}`, innerWidth)) {
+				for (const wrapped of wrapMultiLine(`• ${q}`, innerWidth)) {
 					sections.push(theme.fg("dim", wrapped));
 				}
 			}
